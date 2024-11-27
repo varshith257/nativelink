@@ -45,7 +45,7 @@ use nativelink_util::origin_context::ActiveOriginContext;
 use nativelink_util::proto_stream_utils::{
     FirstStream, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
 };
-use nativelink_util::resource_info::{ResourceInfo, DIGEST_FUNCTIONS};
+use nativelink_util::resource_info::{ResourceInfo, is_supported_digest_function};
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use nativelink_util::{default_health_status_indicator, tls_utils};
@@ -289,8 +289,12 @@ impl GrpcStore {
         .as_deref()
         .unwrap_or("sha256");
 
-        if !DIGEST_FUNCTIONS.contains(&digest_function) {
-            return Err(make_input_err!("Unsupported digest_function: {}in resource_name '{}'", digest_function, resource_name));
+        if !is_supported_digest_function(digest_function) {
+            return Err(make_input_err!(
+                "Unsupported digest_function: {} in resource_name '{}'",
+                digest_function,
+                resource_name
+            ));
         }
     
         error_if!(
@@ -536,9 +540,9 @@ impl StoreDriver for GrpcStore {
         .map_or_else(default_digest_hasher_func, |v| *v)
         .to_string();
 
-    if !DIGEST_FUNCTIONS.contains(&digest_function.as_str()) {
-        return Err(make_input_err!("Unsupported digest_function: {}", digest_function));
-    }
+        if !is_supported_digest_function(&digest_function) {
+            return Err(make_input_err!("Unsupported digest_function: {}", digest_function));
+        }
 
         if matches!(self.store_type, nativelink_config::stores::StoreType::ac) {
             keys.iter()
