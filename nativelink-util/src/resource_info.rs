@@ -271,8 +271,10 @@ fn recursive_parse<'a>(
                     return Ok(state);
                 }
                 if output.digest_function.is_none() {
+                    // Default to "sha256" when no digest function is provided.
                     output.digest_function = Some(Cow::Borrowed("sha256"));
                 }
+                continue;
             }
             State::Hash => {
                 output.hash = Cow::Borrowed(part);
