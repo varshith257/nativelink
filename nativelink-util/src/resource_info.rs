@@ -220,6 +220,10 @@ enum State {
     OptionalMetadata,
 }
 
+pub fn is_supported_digest_function(digest_function: &str) -> bool {
+    DIGEST_FUNCTIONS.contains(&digest_function)
+}
+
 // Iterate backwards looking for "(compressed-)blobs", once found, move forward
 // populating the output struct. This recursive function utilises the stack to
 // temporarily hold the reference to the previous item reducing the need for
