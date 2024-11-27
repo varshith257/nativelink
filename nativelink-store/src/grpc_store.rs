@@ -45,7 +45,7 @@ use nativelink_util::origin_context::ActiveOriginContext;
 use nativelink_util::proto_stream_utils::{
     FirstStream, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
 };
-use nativelink_util::resource_info::ResourceInfo;
+use nativelink_util::resource_info::{ResourceInfo, DIGEST_FUNCTIONS};
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use nativelink_util::{default_health_status_indicator, tls_utils};
@@ -278,6 +278,12 @@ impl GrpcStore {
     ) -> Result<impl Stream<Item = Result<ReadResponse, Status>>, Error> {
         const IS_UPLOAD_FALSE: bool = false;
 
+        let request = grpc_request.into_request();
+        let resource_name = &request.resource_name;
+
+        let mut resource_info = ResourceInfo::new(resource_name, IS_UPLOAD_FALSE)
+        .err_tip(|| "Failed to parse resource_name in GrpcStore::read")?;
+
         let digest_function = resource_info
         .digest_function
         .as_deref()
@@ -292,7 +298,7 @@ impl GrpcStore {
             "CAS operation on AC store"
         );
 
-        let request = self.get_read_request(grpc_request.into_request().into_inner())?;
+        let request = self.get_read_request(request)?;
         self.perform_request(request, |request| async move {
             self.read_internal(request).await
         })
