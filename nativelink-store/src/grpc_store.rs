@@ -276,6 +276,17 @@ impl GrpcStore {
         &self,
         grpc_request: impl IntoRequest<ReadRequest>,
     ) -> Result<impl Stream<Item = Result<ReadResponse, Status>>, Error> {
+        const IS_UPLOAD_FALSE: bool = false;
+
+        let digest_function = resource_info
+        .digest_function
+        .as_deref()
+        .unwrap_or("sha256");
+
+        if !DIGEST_FUNCTIONS.contains(&digest_function) {
+            return Err(make_input_err!("Unsupported digest_function: {}in resource_name '{}'", digest_function, resource_name));
+        }
+    
         error_if!(
             matches!(self.store_type, nativelink_config::stores::StoreType::ac),
             "CAS operation on AC store"
@@ -514,6 +525,16 @@ impl StoreDriver for GrpcStore {
         keys: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
+
+        let digest_function = ActiveOriginContext::get_value(&ACTIVE_HASHER_FUNC)
+        .err_tip(|| "In GrpcStore::has_with_results")?
+        .map_or_else(default_digest_hasher_func, |v| *v)
+        .to_string();
+
+    if !DIGEST_FUNCTIONS.contains(&digest_function.as_str()) {
+        return Err(make_input_err!("Unsupported digest_function: {}", digest_function));
+    }
+
         if matches!(self.store_type, nativelink_config::stores::StoreType::ac) {
             keys.iter()
                 .zip(results.iter_mut())
