@@ -99,7 +99,7 @@ enum SideChannelFailureReason {
 }
 
 /// This represents the json data that can be passed from the running process
-/// to the parent via the SideChannelFile. See:
+/// to the parent via the `SideChannelFile`. See:
 /// `config::EnvironmentSource::sidechannelfile` for more details.
 /// Note: Any fields added here must be added to the documentation.
 #[derive(Debug, Deserialize, Default)]
@@ -148,7 +148,7 @@ pub fn download_to_directory<'a>(
             futures.push(
                 cas_store
                     .populate_fast_store(digest.into())
-                    .and_then(move |_| async move {
+                    .and_then(move |()| async move {
                         let file_entry = filesystem_store
                             .get_file_entry_for_digest(&digest)
                             .await
@@ -680,7 +680,7 @@ impl RunningActionImpl {
             });
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
-            let (command, _) = try_join(command_fut, async {
+            let (command, ()) = try_join(command_fut, async {
                 fs::create_dir(&self.work_directory)
                     .await
                     .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
@@ -911,7 +911,7 @@ impl RunningActionImpl {
         let mut sleep_fut = (self.running_actions_manager.callbacks.sleep_fn)(self.timeout).fuse();
         loop {
             tokio::select! {
-                _ = &mut sleep_fut => {
+                () = &mut sleep_fut => {
                     self.running_actions_manager.metrics.task_timeouts.inc();
                     killed_action = true;
                     if let Err(err) = child_process_guard.start_kill() {
@@ -1206,7 +1206,7 @@ impl RunningActionImpl {
         });
         drop(output_path_futures);
         let (stdout_digest, stderr_digest) = match upload_result {
-            Ok((stdout_digest, stderr_digest, _)) => (stdout_digest, stderr_digest),
+            Ok((stdout_digest, stderr_digest, ())) => (stdout_digest, stderr_digest),
             Err(e) => return Err(e).err_tip(|| "Error while uploading results"),
         };
 
@@ -1377,7 +1377,7 @@ pub struct Callbacks {
 }
 
 /// The set of additional information for executing an action over and above
-/// those given in the ActionInfo passed to the worker.  This allows
+/// those given in the `ActionInfo` passed to the worker.  This allows
 /// modification of the action for execution on this particular worker.  This
 /// may be used to run the action with a particular set of additional
 /// environment variables, or perhaps configure it to execute within a
@@ -1385,12 +1385,12 @@ pub struct Callbacks {
 #[derive(Default)]
 pub struct ExecutionConfiguration {
     /// If set, will be executed instead of the first argument passed in the
-    /// ActionInfo with all of the arguments in the ActionInfo passed as
+    /// `ActionInfo` with all of the arguments in the `ActionInfo` passed as
     /// arguments to this command.
     pub entrypoint: Option<String>,
     /// The only environment variables that will be specified when the command
-    /// executes other than those in the ActionInfo.  On Windows, SystemRoot
-    /// and PATH are also assigned (see inner_execute).
+    /// executes other than those in the `ActionInfo`.  On Windows, `SystemRoot`
+    /// and PATH are also assigned (see `inner_execute`).
     pub additional_environment: Option<HashMap<String, EnvironmentSource>>,
 }
 
@@ -1465,8 +1465,8 @@ impl UploadActionResults {
         }
     }
 
-    /// Formats the message field in ExecuteResponse from the success_message_template or
-    /// failure_message_template config templates.
+    /// Formats the message field in `ExecuteResponse` from the `success_message_template`
+    /// or `failure_message_template` config templates.
     fn format_execute_response_message(
         mut template_str: Template,
         action_digest_info: DigestInfo,
@@ -1761,7 +1761,7 @@ impl RunningActionsManagerImpl {
             format!("Expected action id '{operation_id:?}' to exist in RunningActionsManagerImpl")
         });
         // No need to copy anything, we just are telling the receivers an event happened.
-        self.action_done_tx.send_modify(|_| {});
+        self.action_done_tx.send_modify(|()| {});
         result.map(|_| ())
     }
 
@@ -1890,7 +1890,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
         let _ = self
             .action_done_tx
             .subscribe()
-            .wait_for(|_| self.running_actions.lock().is_empty())
+            .wait_for(|()| self.running_actions.lock().is_empty())
             .await;
     }
 
@@ -1917,7 +1917,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
         let _ = self
             .action_done_tx
             .subscribe()
-            .wait_for(|_| self.running_actions.lock().is_empty())
+            .wait_for(|()| self.running_actions.lock().is_empty())
             .await;
     }
 

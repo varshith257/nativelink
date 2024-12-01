@@ -141,7 +141,7 @@ fn to_full_path_from_key(folder: &str, key: &StoreKey) -> OsString {
 }
 
 pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
-    /// Responsible for creating the underlying FileEntry.
+    /// Responsible for creating the underlying `FileEntry`.
     fn create(data_size: u64, block_size: u64, encoded_file_path: RwLock<EncodedFilePath>) -> Self;
 
     /// Creates a (usually) temp file, opens it and returns the path to the temp file.
@@ -158,7 +158,7 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     /// Returns the actual size of the underlying file on the disk after accounting for filesystem block size.
     fn size_on_disk(&self) -> u64;
 
-    /// Gets the underlying EncodedfilePath.
+    /// Gets the underlying `EncodedfilePath`.
     fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath>;
 
     /// Returns a reader that will read part of the underlying file.
@@ -205,9 +205,9 @@ impl FileEntry for FileEntryImpl {
         }
     }
 
-    /// This encapsolates the logic for the edge case of if the file fails to create
-    /// the cleanup of the file is handled without creating a FileEntry, which would
-    /// try to cleanup the file as well during drop().
+    /// This encapsulates the logic for the edge case of if the file fails to create
+    /// the cleanup of the file is handled without creating a `FileEntry`, which would
+    /// try to cleanup the file as well during `drop()`.
     async fn make_and_open_file(
         block_size: u64,
         encoded_file_path: EncodedFilePath,
@@ -428,7 +428,7 @@ pub fn key_from_filename(file_name: &str) -> Result<StoreKey<'static>, Error> {
 }
 
 /// The number of files to read the metadata for at the same time when running
-/// add_files_to_cache.
+/// `add_files_to_cache`.
 const SIMULTANEOUS_METADATA_READS: usize = 200;
 
 async fn add_files_to_cache<Fe: FileEntry>(
@@ -906,7 +906,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                 let sleep_fn = (self.sleep_fn)(fs::idle_file_descriptor_timeout());
                 tokio::pin!(sleep_fn);
                 tokio::select! {
-                    _ = & mut (sleep_fn) => {
+                    () = & mut (sleep_fn) => {
                         resumeable_temp_file
                             .close_file()
                             .await
