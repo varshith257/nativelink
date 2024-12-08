@@ -775,7 +775,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // insert them into the cache. In theory it should be able to elide this conversion
         // but it seems to be a bit tricky to get right.
         self.evicting_map
-            .sizes_for_keys::::<_, StoreKey<'_>, &StoreKey<'_>>(keys.iter(), results, false /* peek */)
+            .sizes_for_keys::<_, StoreKey<'_>, &StoreKey<'_>>(keys.iter(), results, false /* peek */)
             .await;
         // We need to do a special pass to ensure our zero files exist.
         // If our results failed and the result was a zero file, we need to
