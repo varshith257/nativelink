@@ -410,9 +410,9 @@ impl LenEntry for FileEntryImpl {
 }
 
 #[inline]
-pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'_>, Error> {
+pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'static>, Error> {
     if let Some(file_name) = file_name.strip_prefix(STRING_PREFIX) {
-        return Ok(StoreKey::new_str(file_name));
+        return Ok(StoreKey::new_str(&file_name.to_owned()));
     }
 
     if let Some(name) = file_name.strip_prefix(DIGEST_PREFIX) {
@@ -424,7 +424,7 @@ pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'_>, Error> {
         .split_once('-')
         .err_tip(|| "Invalid filename format")?;
     let size = size.parse::<i64>()?;
-    let digest = DigestInfo::try_new(hash, size)?;
+    let digest = DigestInfo::try_new(&hash.to_owned(), size)?;
     Ok(StoreKey::Digest(digest))
 }
 
