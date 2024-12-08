@@ -770,22 +770,16 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         keys: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
-        // TODO(allada) This is a bit of a hack to get around the lifetime issues with the
-        // existence_cache. We need to convert the digests to owned values to be able to
-        // insert them into the cache. In theory it should be able to elide this conversion
-        // but it seems to be a bit tricky to get right.
+        let keys: Vec<_> = keys.iter().map(|v| v.borrow().into_owned()).collect();
+
         self.evicting_map
-            .sizes_for_keys::<_, StoreKey<'_>, &StoreKey<'_>>(
-                keys.iter(),
-                results,
-                false, /* peek */
-            )
+            .sizes_for_keys(&keys, results, false /* peek */)
             .await;
         // We need to do a special pass to ensure our zero files exist.
         // If our results failed and the result was a zero file, we need to
         // create the file by spec.
         for (key, result) in keys.iter().zip(results.iter_mut()) {
-            if result.is_some() || !is_zero_digest(key.clone()) {
+            if result.is_some() || !is_zero_digest(key.borrow()) {
                 continue;
             }
             let (mut tx, rx) = make_buf_channel_pair();
@@ -879,8 +873,8 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        if is_zero_digest(key.clone()) {
-            self.has(key.clone())
+        if is_zero_digest(key.borrow()) {
+            self.has(key.borrow())
                 .await
                 .err_tip(|| "Failed to check if zero digest exists in filesystem store")?;
             writer
@@ -889,13 +883,17 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(());
         }
 
-        let entry = self.evicting_map.get(&key).await.ok_or_else(|| {
-            make_err!(
-                Code::NotFound,
-                "{:?} not found in filesystem store",
-                key.as_str()
-            )
-        })?;
+        let entry = self
+            .evicting_map
+            .get(&key.borrow().into_owned())
+            .await
+            .ok_or_else(|| {
+                make_err!(
+                    Code::NotFound,
+                    "{:?} not found in filesystem store",
+                    key.as_str()
+                )
+            })?;
         let read_limit = length.unwrap_or(u64::MAX);
         let mut resumeable_temp_file = entry.read_file_part(offset, read_limit).await?;
 
