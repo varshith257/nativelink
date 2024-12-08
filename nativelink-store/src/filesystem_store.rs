@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::borrow::Cow;
-use std::clone;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
@@ -79,7 +78,6 @@ enum PathType {
 // lot of small files, so to prevent storing duplicate data, we store an Arc
 // to the path of the directory where the file is stored and the packed digest.
 // Resulting in usize + sizeof(DigestInfo).
-type FileNameDigest = DigestInfo;
 pub struct EncodedFilePath {
     shared_context: Arc<SharedContext>,
     path_type: PathType,
@@ -325,7 +323,7 @@ fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
         // For string-based keys, append a counter-based suffix for uniqueness
         StoreKey::Str(key) => {
             let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let temp_key = format!("{}_temp{}", key, suffix);
+            let temp_key = format!("{key}_temp{suffix}");
             StoreKey::Str(Cow::Owned(temp_key))
         }
     }
@@ -384,9 +382,8 @@ impl LenEntry for FileEntryImpl {
             let from_path = encoded_file_path.get_file_path();
             let new_key = make_temp_key(&encoded_file_path.key);
 
-            let to_path = match &encoded_file_path.shared_context.temp_path {
-                temp_path => to_full_path_from_key(temp_path, &new_key),
-            };
+            let temp_path = &encoded_file_path.shared_context.temp_path;
+            let to_path = to_full_path_from_key(temp_path, &new_key);
 
             if let Err(err) = fs::rename(&from_path, &to_path).await {
                 event!(
@@ -632,7 +629,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     }
 
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
-        let key = <StoreKey<'static>>::Digest((*digest).into());
+        let key = <StoreKey<'static>>::Digest(*digest);
         self.evicting_map
             .get(&key)
             .await
@@ -786,7 +783,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             let send_eof_result = tx.send_eof();
             self.update(key.borrow(), rx, UploadSizeInfo::ExactSize(0))
                 .await
-                .err_tip(|| format!("Failed to create zero file for key {:?}", key))
+                .err_tip(|| format!("Failed to create zero file for key {key:?}"))
                 .merge(
                     send_eof_result
                         .err_tip(|| "Failed to send zero file EOF in filesystem store has"),
