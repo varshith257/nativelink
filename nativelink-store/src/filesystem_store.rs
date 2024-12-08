@@ -414,12 +414,6 @@ impl LenEntry for FileEntryImpl {
 }
 
 #[inline]
-fn digest_from_filename(file_name: &str) -> Result<DigestInfo, Error> {
-    let (hash, size) = file_name.split_once('-').err_tip(|| "")?;
-    let size = size.parse::<i64>()?;
-    DigestInfo::try_new(hash, size)
-}
-
 pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'static>, Error> {
     if let Some(file_name) = file_name.strip_prefix(STRING_PREFIX) {
         return Ok(StoreKey::Str(Cow::Owned(file_name.to_owned())));
@@ -430,7 +424,12 @@ pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'static>, Error
     }
 
     // Fallback: legacy digest handling for backward compatibility
-    digest_from_filename(file_name).map(StoreKey::Digest)
+    let (hash, size) = file_name
+        .split_once('-')
+        .err_tip(|| "Invalid filename format")?;
+    let size = size.parse::<i64>()?;
+    let digest = DigestInfo::try_new(hash, size)?;
+    Ok(StoreKey::Digest(digest))
 }
 
 /// The number of files to read the metadata for at the same time when running
