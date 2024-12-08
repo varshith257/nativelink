@@ -424,7 +424,7 @@ pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'static>, Error
         .split_once('-')
         .err_tip(|| "Invalid filename format")?;
     let size = size.parse::<i64>()?;
-    let digest = DigestInfo::try_new(&hash.to_owned(), size)?;
+    let digest = DigestInfo::try_new(hash, size)?;
     Ok(StoreKey::Digest(digest))
 }
 
