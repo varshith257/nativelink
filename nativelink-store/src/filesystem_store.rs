@@ -50,7 +50,7 @@ const DEFAULT_BUFF_SIZE: usize = 32 * 1024;
 const DEFAULT_BLOCK_SIZE: u64 = 4 * 1024;
 
 pub const STRING_PREFIX: &str = "s-";
-pub const DIGEST_PREFIX: &str = "h-";
+pub const DIGEST_PREFIX: &str = "d-";
 
 #[derive(Debug, MetricsComponent)]
 pub struct SharedContext {
@@ -139,7 +139,8 @@ fn to_full_path_from_key(folder: &str, key: &StoreKey) -> OsString {
         StoreKey::Str(str) => format!("{folder}/{STRING_PREFIX}{str}"),
         StoreKey::Digest(digest_info) => format!("{folder}/{DIGEST_PREFIX}{digest_info}"),
     }
-    .into()}
+    .into()
+}
 
 pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     /// Responsible for creating the underlying FileEntry.
