@@ -135,8 +135,11 @@ impl Drop for EncodedFilePath {
 
 #[inline]
 fn to_full_path_from_key(folder: &str, key: &StoreKey) -> OsString {
-    format!("{folder}/{}", key.as_str()).into()
-}
+    match key {
+        StoreKey::Str(str) => format!("{folder}/{STRING_PREFIX}{str}"),
+        StoreKey::Digest(digest_info) => format!("{folder}/{DIGEST_PREFIX}{digest_info}"),
+    }
+    .into()}
 
 pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     /// Responsible for creating the underlying FileEntry.
