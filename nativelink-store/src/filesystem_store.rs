@@ -410,19 +410,13 @@ impl LenEntry for FileEntryImpl {
 }
 
 #[inline]
-pub fn key_from_filename(file_name: &str) -> Result<StoreKey<'static>, Error> {
+pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'static>, Error> {
     if let Some(file_name) = file_name.strip_prefix(STRING_PREFIX) {
-        return Ok(StoreKey::Str(Cow::Owned(file_name.to_string())));
+        return Ok(StoreKey::new_str(file_name));
     }
 
-    if let Some(file_name) = file_name.strip_prefix(DIGEST_PREFIX) {
-        // Handle digest-based keys (StoreKey::Digest)
-        let (hash, size) = file_name
-            .split_once('-')
-            .err_tip(|| "Invalid filename format")?;
-        let size = size.parse::<i64>()?;
-        let digest = DigestInfo::try_new(hash, size)?;
-        return Ok(StoreKey::Digest(digest));
+    if let Some(name) = file_name.strip_prefix(DIGEST_PREFIX) {
+        file_name = name;
     }
 
     // Fallback: legacy digest handling for backward compatibility
