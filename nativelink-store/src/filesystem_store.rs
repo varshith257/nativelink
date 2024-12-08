@@ -775,7 +775,11 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // insert them into the cache. In theory it should be able to elide this conversion
         // but it seems to be a bit tricky to get right.
         self.evicting_map
-            .sizes_for_keys::<_, StoreKey<'_>, &StoreKey<'_>>(keys.iter(), results, false /* peek */)
+            .sizes_for_keys::<_, StoreKey<'_>, &StoreKey<'_>>(
+                keys.iter(),
+                results,
+                false, /* peek */
+            )
             .await;
         // We need to do a special pass to ensure our zero files exist.
         // If our results failed and the result was a zero file, we need to
@@ -786,7 +790,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             }
             let (mut tx, rx) = make_buf_channel_pair();
             let send_eof_result = tx.send_eof();
-            self.update(key.to_owned(), rx, UploadSizeInfo::ExactSize(0))
+            self.update(key.borrow(), rx, UploadSizeInfo::ExactSize(0))
                 .await
                 .err_tip(|| format!("Failed to create zero file for key {:?}", key))
                 .merge(
@@ -875,7 +879,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        if is_zero_digest_key(key.clone()) {
+        if is_zero_digest(key.clone()) {
             self.has(key.clone())
                 .await
                 .err_tip(|| "Failed to check if zero digest exists in filesystem store")?;
@@ -885,10 +889,13 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(());
         }
 
-        let entry =
-            self.evicting_map.get(&key).await.ok_or_else(|| {
-                make_err!(Code::NotFound, "{:?} not found in filesystem store", key.as_str())
-            })?;
+        let entry = self.evicting_map.get(&key).await.ok_or_else(|| {
+            make_err!(
+                Code::NotFound,
+                "{:?} not found in filesystem store",
+                key.as_str()
+            )
+        })?;
         let read_limit = length.unwrap_or(u64::MAX);
         let mut resumeable_temp_file = entry.read_file_part(offset, read_limit).await?;
 
