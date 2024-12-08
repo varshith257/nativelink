@@ -36,6 +36,7 @@ use nativelink_store::filesystem_store::{
 };
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{fs, DigestInfo};
+use nativelink_store::filesystem_store::DIGEST_PREFIX;
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::origin_context::ContextAwareFuture;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
@@ -659,8 +660,8 @@ async fn oldest_entry_evicted_with_access_times_loaded_from_disk() -> Result<(),
     fs::create_dir_all(&content_path).await?;
 
     // Make the two files on disk before loading the store.
-    let file1 = OsString::from(format!("{content_path}/{DIGEST_PREFIX}{{digest1}"));
-    let file2 = OsString::from(format!("{content_path}/{DIGEST_PREFIX}{{digest2}"));
+    let file1 = OsString::from(format!("{content_path}/{DIGEST_PREFIX}{{digest1}}"));
+    let file2 = OsString::from(format!("{content_path}/{DIGEST_PREFIX}{{digest2}}"));
     write_file(&file1, VALUE1.as_bytes()).await?;
     write_file(&file2, VALUE2.as_bytes()).await?;
     set_file_atime(&file1, FileTime::from_unix_time(0, 0))?;
