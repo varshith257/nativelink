@@ -410,7 +410,7 @@ impl LenEntry for FileEntryImpl {
 }
 
 #[inline]
-pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'static>, Error> {
+pub fn key_from_filename(mut file_name: &str) -> Result<StoreKey<'_>, Error> {
     if let Some(file_name) = file_name.strip_prefix(STRING_PREFIX) {
         return Ok(StoreKey::new_str(file_name));
     }
