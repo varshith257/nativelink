@@ -309,7 +309,7 @@ fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
     match key {
         // For digest-based keys, generate a unique suffix using the counter
         StoreKey::Digest(digest) => {
-            let mut temp_digest: [u8; 32] = digest.packed_hash().into();
+            let mut temp_digest: [u8; 32] = digest.packed_hash().as_ref().try_into().expect("PackedHash should fit into [u8; 32]");
             let counter = TEMP_FILE_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .to_le_bytes();
@@ -769,8 +769,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // existence_cache. We need to convert the digests to owned values to be able to
         // insert them into the cache. In theory it should be able to elide this conversion
         // but it seems to be a bit tricky to get right.
-        let owned_keys: Vec<StoreKey<'static>> = keys.iter().map(|key| key.to_owned()).collect();
-
+        let owned_keys: Vec<StoreKey<'static>> = keys.iter().map(|key| key.clone().into_owned()).collect();
         self.evicting_map
             .sizes_for_keys(&owned_keys, results, false /* peek */)
             .await;
@@ -874,8 +873,8 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
     ) -> Result<(), Error> {
         let is_zero_digest_key = is_zero_digest(key.clone());
         if is_zero_digest_key {
-            self.has(&[key.clone()])
-                .await
+            self.has(&[*key])
+            .await
                 .err_tip(|| "Failed to check if zero digest exists in filesystem store")?;
             writer
                 .send_eof()
