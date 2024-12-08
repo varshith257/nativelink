@@ -32,11 +32,10 @@ use nativelink_error::{make_err, Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{
-    key_from_filename, EncodedFilePath, FileEntry, FileEntryImpl, FilesystemStore,
+    key_from_filename, EncodedFilePath, FileEntry, FileEntryImpl, FilesystemStore, DIGEST_PREFIX,
 };
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{fs, DigestInfo};
-use nativelink_store::filesystem_store::DIGEST_PREFIX;
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::origin_context::ContextAwareFuture;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
