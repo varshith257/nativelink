@@ -1092,7 +1092,7 @@ async fn has_with_results_on_zero_digests() -> Result<(), Error> {
             yield_fn().await?;
 
             let empty_digest_file_name =
-                OsString::from(format!("{content_path}/{DIGEST_PREFIX}{digest}"));
+                OsString::from(format!("{content_path}/{DIGEST_PREFIX}{}", digest));
 
             let file_metadata = fs::metadata(empty_digest_file_name)
                 .await
