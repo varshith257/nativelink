@@ -797,7 +797,7 @@ async fn eviction_on_insert_calls_unref_once() -> Result<(), Error> {
     const BIG_VALUE: &str = "0123";
 
     static UNREFED_DIGESTS: LazyLock<Mutex<Vec<StoreKey<'static>>>> =
-            LazyLock::new(|| Mutex::new(Vec::new()));
+        LazyLock::new(|| Mutex::new(Vec::new()));
     struct LocalHooks {}
     impl FileEntryHooks for LocalHooks {
         fn on_unref<Fe: FileEntry>(file_entry: &Fe) {
@@ -1091,7 +1091,8 @@ async fn has_with_results_on_zero_digests() -> Result<(), Error> {
         loop {
             yield_fn().await?;
 
-            let empty_digest_file_name = OsString::from(format!("{content_path}/{DIGEST_PREFIX}{digest}"));
+            let empty_digest_file_name =
+                OsString::from(format!("{content_path}/{DIGEST_PREFIX}{digest}"));
 
             let file_metadata = fs::metadata(empty_digest_file_name)
                 .await

@@ -52,7 +52,6 @@ const DEFAULT_BLOCK_SIZE: u64 = 4 * 1024;
 pub const STRING_PREFIX: &str = "s-";
 pub const DIGEST_PREFIX: &str = "h-";
 
-
 #[derive(Debug, MetricsComponent)]
 pub struct SharedContext {
     // Used in testing to know how many active drop() spawns are running.
@@ -311,16 +310,18 @@ fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
         // For digest-based keys, generate a unique suffix using the counter
         StoreKey::Digest(digest) => {
             let mut temp_digest = *digest.packed_hash();
-            let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes();
+            let counter = TEMP_FILE_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .to_le_bytes();
             temp_digest[24..].clone_from_slice(&counter);
 
-            StoreKey::Digest(DigestInfo::from_packed_hash(temp_digest))
+            StoreKey::Digest(DigestInfo::new(temp_digest, digest.size_bytes()))
         }
         // For string-based keys, append a counter-based suffix for uniqueness
         StoreKey::Str(key) => {
             let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let temp_key = format!("{}_temp{}", key, suffix);
-            StoreKey::Str(Box::leak(temp_key.into_boxed_str()))
+            StoreKey::Str(Cow::Owned(temp_key))
         }
     }
 }
@@ -376,7 +377,7 @@ impl LenEntry for FileEntryImpl {
                 return;
             }
             let from_path = encoded_file_path.get_file_path();
-            let mut new_key = make_temp_key(&encoded_file_path.key);
+            let new_key = make_temp_key(&encoded_file_path.key);
 
             let to_path = match &encoded_file_path.shared_context.temp_path {
                 temp_path => to_full_path_from_key(temp_path, &new_key),
@@ -409,19 +410,23 @@ impl LenEntry for FileEntryImpl {
 #[inline]
 pub fn key_from_filename(file_name: &str) -> Result<StoreKey<'static>, Error> {
     if let Some(file_name) = file_name.strip_prefix(STRING_PREFIX) {
-        return Ok(StoreKey::Str(file_name.into()));
+        return Ok(StoreKey::Str(Cow::Owned(file_name.to_string())));
     }
 
     if let Some(file_name) = file_name.strip_prefix(DIGEST_PREFIX) {
         // Handle digest-based keys (StoreKey::Digest)
-        let (hash, size) = file_name.split_once('-').err_tip(|| "Invalid filename format")?;
+        let (hash, size) = file_name
+            .split_once('-')
+            .err_tip(|| "Invalid filename format")?;
         let size = size.parse::<i64>()?;
         let digest = DigestInfo::try_new(hash, size)?;
         return Ok(StoreKey::Digest(digest));
     }
 
     // Fallback: legacy digest handling for backward compatibility
-    let (hash, size) = file_name.split_once('-').err_tip(|| "Invalid filename format")?;
+    let (hash, size) = file_name
+        .split_once('-')
+        .err_tip(|| "Invalid filename format")?;
     let size = size.parse::<i64>()?;
     let digest = DigestInfo::try_new(hash, size)?;
     Ok(StoreKey::Digest(digest))
@@ -438,7 +443,7 @@ async fn add_files_to_cache<Fe: FileEntry>(
     block_size: u64,
 ) -> Result<(), Error> {
     async fn process_entry<Fe: FileEntry>(
-        evicting_map: &EvictingMap<DigestInfo, Arc<Fe>, SystemTime>,
+        evicting_map: &EvictingMap<StoreKey<'static>, Arc<Fe>, SystemTime>,
         file_name: &str,
         atime: SystemTime,
         data_size: u64,
@@ -622,8 +627,9 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     }
 
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
+        let key = <StoreKey<'static>>::Digest(digest.into());
         self.evicting_map
-            .get(digest)
+            .get(&key)
             .await
             .ok_or_else(|| make_err!(Code::NotFound, "{digest} not found in filesystem store"))
     }
@@ -778,7 +784,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             let send_eof_result = tx.send_eof();
             self.update(key.clone(), rx, UploadSizeInfo::ExactSize(0))
                 .await
-                .err_tip(|| format!("Failed to create zero file for key {key}"))
+                .err_tip(|| format!("Failed to create zero file for key {:?}", key))
                 .merge(
                     send_eof_result
                         .err_tip(|| "Failed to send zero file EOF in filesystem store has"),
@@ -823,7 +829,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         mut file: fs::ResumeableFileSlot,
         upload_size: UploadSizeInfo,
     ) -> Result<Option<fs::ResumeableFileSlot>, Error> {
-        let key_owned = key.to_owned();
+        let key_owned = key.into_owned();
         let path = file.get_path().as_os_str().to_os_string();
         let file_size = match upload_size {
             UploadSizeInfo::ExactSize(size) => size,
@@ -876,10 +882,13 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(());
         }
 
-        let entry =
-            self.evicting_map.get(&key_owned).await.ok_or_else(|| {
-                make_err!(Code::NotFound, "{key_owned} not found in filesystem store")
-            })?;
+        let entry = self.evicting_map.get(&key_owned).await.ok_or_else(|| {
+            make_err!(
+                Code::NotFound,
+                "{:?} not found in filesystem store",
+                key_owned
+            )
+        })?;
         let read_limit = length.unwrap_or(u64::MAX);
         let mut resumeable_temp_file = entry.read_file_part(offset, read_limit).await?;
 
