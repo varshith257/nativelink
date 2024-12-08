@@ -309,7 +309,7 @@ fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
     match key {
         // For digest-based keys, generate a unique suffix using the counter
         StoreKey::Digest(digest) => {
-            let mut temp_digest = digest.packed_hash().into();
+            let mut temp_digest: [u8; 32] = digest.packed_hash().into();
             let counter = TEMP_FILE_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .to_le_bytes();
@@ -769,13 +769,15 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // existence_cache. We need to convert the digests to owned values to be able to
         // insert them into the cache. In theory it should be able to elide this conversion
         // but it seems to be a bit tricky to get right.
+        let owned_keys: Vec<StoreKey<'static>> = keys.iter().map(|key| key.to_owned()).collect();
+
         self.evicting_map
-            .sizes_for_keys(keys, results, false /* peek */)
+            .sizes_for_keys(&owned_keys, results, false /* peek */)
             .await;
         // We need to do a special pass to ensure our zero files exist.
         // If our results failed and the result was a zero file, we need to
         // create the file by spec.
-        for (key, result) in keys.iter().zip(results.iter_mut()) {
+        for (key, result) in owned_keys.iter().zip(results.iter_mut()) {
             if result.is_some() || !is_zero_digest(key.clone()) {
                 continue;
             }
@@ -870,7 +872,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        let is_zero_digest_key = is_zero_digest(&key);
+        let is_zero_digest_key = is_zero_digest(key.clone());
         if is_zero_digest_key {
             self.has(&[key.clone()])
                 .await
@@ -881,13 +883,10 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(());
         }
 
-        let entry = self.evicting_map.get(&key).await.ok_or_else(|| {
-            make_err!(
-                Code::NotFound,
-                "{:?} not found in filesystem store",
-                key_owned
-            )
-        })?;
+        let entry =
+            self.evicting_map.get(&key).await.ok_or_else(|| {
+                make_err!(Code::NotFound, "{:?} not found in filesystem store", key)
+            })?;
         let read_limit = length.unwrap_or(u64::MAX);
         let mut resumeable_temp_file = entry.read_file_part(offset, read_limit).await?;
 
