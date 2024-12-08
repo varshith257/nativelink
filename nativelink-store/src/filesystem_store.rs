@@ -136,7 +136,7 @@ impl Drop for EncodedFilePath {
 
 #[inline]
 fn to_full_path_from_key(folder: &str, key: &StoreKey) -> OsString {
-    format!("{folder}/{key.as_str()}").into()
+    format!("{folder}/{}", key.as_str()).into()
 }
 
 pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
@@ -309,7 +309,7 @@ fn make_temp_key(key: &StoreKey) -> StoreKey<'static> {
     match key {
         // For digest-based keys, generate a unique suffix using the counter
         StoreKey::Digest(digest) => {
-            let mut temp_digest = *digest.packed_hash();
+            let mut temp_digest = digest.packed_hash().into();
             let counter = TEMP_FILE_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .to_le_bytes();
@@ -627,7 +627,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     }
 
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
-        let key = <StoreKey<'static>>::Digest(digest.into());
+        let key = <StoreKey<'static>>::Digest((*digest).into());
         self.evicting_map
             .get(&key)
             .await
@@ -769,9 +769,8 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // existence_cache. We need to convert the digests to owned values to be able to
         // insert them into the cache. In theory it should be able to elide this conversion
         // but it seems to be a bit tricky to get right.
-        let keys: Vec<_> = keys.iter().map(|key| key.borrow().to_owned()).collect();
         self.evicting_map
-            .sizes_for_keys(&keys, results, false /* peek */)
+            .sizes_for_keys(keys, results, false /* peek */)
             .await;
         // We need to do a special pass to ensure our zero files exist.
         // If our results failed and the result was a zero file, we need to
@@ -782,7 +781,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             }
             let (mut tx, rx) = make_buf_channel_pair();
             let send_eof_result = tx.send_eof();
-            self.update(key.clone(), rx, UploadSizeInfo::ExactSize(0))
+            self.update(key.to_owned(), rx, UploadSizeInfo::ExactSize(0))
                 .await
                 .err_tip(|| format!("Failed to create zero file for key {:?}", key))
                 .merge(
@@ -871,9 +870,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        let key_owned = key.to_owned();
-        if is_zero_digest(key) {
-            self.has(key_owned.clone())
+        let is_zero_digest_key = is_zero_digest(&key);
+        if is_zero_digest_key {
+            self.has(&[key.clone()])
                 .await
                 .err_tip(|| "Failed to check if zero digest exists in filesystem store")?;
             writer
@@ -882,7 +881,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(());
         }
 
-        let entry = self.evicting_map.get(&key_owned).await.ok_or_else(|| {
+        let entry = self.evicting_map.get(&key).await.ok_or_else(|| {
             make_err!(
                 Code::NotFound,
                 "{:?} not found in filesystem store",
