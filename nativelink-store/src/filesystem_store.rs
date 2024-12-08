@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::clone;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
@@ -774,13 +775,13 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // insert them into the cache. In theory it should be able to elide this conversion
         // but it seems to be a bit tricky to get right.
         self.evicting_map
-            .sizes_for_keys(keys, results, false /* peek */)
+            .sizes_for_keys::::<_, StoreKey<'_>, &StoreKey<'_>>(keys.iter(), results, false /* peek */)
             .await;
         // We need to do a special pass to ensure our zero files exist.
         // If our results failed and the result was a zero file, we need to
         // create the file by spec.
         for (key, result) in keys.iter().zip(results.iter_mut()) {
-            if result.is_some() || !is_zero_digest(*key) {
+            if result.is_some() || !is_zero_digest(key.clone()) {
                 continue;
             }
             let (mut tx, rx) = make_buf_channel_pair();
@@ -874,8 +875,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        let is_zero_digest_key = is_zero_digest(key.clone());
-        if is_zero_digest_key {
+        if is_zero_digest_key(key.clone()) {
             self.has(key.clone())
                 .await
                 .err_tip(|| "Failed to check if zero digest exists in filesystem store")?;
@@ -887,7 +887,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
 
         let entry =
             self.evicting_map.get(&key).await.ok_or_else(|| {
-                make_err!(Code::NotFound, "{:?} not found in filesystem store", key)
+                make_err!(Code::NotFound, "{:?} not found in filesystem store", key.as_str())
             })?;
         let read_limit = length.unwrap_or(u64::MAX);
         let mut resumeable_temp_file = entry.read_file_part(offset, read_limit).await?;
