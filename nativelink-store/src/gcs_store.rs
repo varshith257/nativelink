@@ -18,33 +18,46 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::future::FusedFuture;
+use futures::stream;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
-use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
+use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest};
 use nativelink_config::stores::GCSSpec;
-use nativelink_error::{make_err, Code, Error, ResultExt};
+use nativelink_error::{make_err, Code, Error};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{
-    make_buf_channel_pair, DropCloserReadHalf, DropCloserWriteHalf,
-};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
-use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::random;
-use reqwest;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest_middleware::{ClientWithMiddleware as Client, RequestBuilder};
 use tracing::debug;
 
 // Minimum and maximum size for GCS multipart uploads.
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024;
+
 const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+const ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'*')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_');
+
+pub(crate) trait Escape {
+    fn escape(&self) -> String;
+}
+
+impl Escape for String {
+    fn escape(&self) -> String {
+        utf8_percent_encode(self, ENCODE_SET).to_string()
+    }
+}
 
 #[derive(MetricsComponent)]
 pub struct GCSStore {
@@ -71,21 +84,23 @@ impl GCSStore {
             .map(Arc::new)
             .map_err(|e| make_err!(Code::Unavailable, "Failed to initialize GCS client: {e:?}"))?;
 
+        let retry_config = spec.retry.clone();
+
         let retrier = Retrier::new(
             Arc::new(move |duration| {
                 // Jitter: +/-50% random variation
                 // This helps distribute retries more evenly and prevents synchronized bursts.
                 // Reference: https://cloud.google.com/storage/docs/retry-strategy#exponential-backoff
-                let jitter = random::<f32>() * (spec.retry.jitter / 2.0);
+                let jitter = random::<f32>() * (retry_config.jitter / 2.0);
                 let backoff_with_jitter = duration.mul_f32(1.0 + jitter);
                 Box::pin(tokio::time::sleep(backoff_with_jitter))
             }),
             Arc::new(|delay| {
                 // Exponential backoff: Multiply delay by 2, with an upper cap
                 let exponential_backoff = delay.mul_f32(2.0);
-                Duration::from_secs_f32(spec.retry.delay).min(exponential_backoff)
+                Duration::from_secs_f32(retry_config.delay).min(exponential_backoff)
             }),
-            spec.retry.clone(),
+            retry_config,
         );
 
         Ok(Arc::new(Self {
@@ -101,6 +116,47 @@ impl GCSStore {
 
     fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
         format!("{}{}", self.key_prefix, key.as_str())
+    }
+
+    /// Creates a request for initiating a resumable upload session.
+    ///
+    /// This custom method mirrors `build_resumable_session_simple` from the
+    /// `google-cloud-storage` crate, which is currently inaccessible as it is
+    /// marked `pub(crate)`. If made public, this can be replaced.
+    ///
+    /// See: https://github.com/yoshidan/google-cloud-rust/issues/328
+    fn build_resumable_session_simple(
+        base_url: &str,
+        client: &Client,
+        req: &UploadObjectRequest,
+        media: &Media,
+    ) -> RequestBuilder {
+        let url = format!(
+            "{}/b/{}/o?uploadType=resumable",
+            base_url,
+            req.bucket.escape(),
+        );
+        let mut builder = client
+            .post(url)
+            .query(&req)
+            .query(&[("name", &media.name)])
+            .header(CONTENT_LENGTH, 0)
+            .header("X-Upload-Content-Type", media.content_type.to_string());
+
+        if let Some(len) = media.content_length {
+            builder = builder.header("X-Upload-Content-Length", len)
+        }
+        if let Some(encryption) = &req.encryption {
+            builder = builder
+                .header("x-goog-encryption-algorithm", encryption.algorithm.clone())
+                .header("x-goog-encryption-key", encryption.key.clone())
+                .header(
+                    "x-goog-encryption-key-sha256",
+                    encryption.key_sha256.clone(),
+                );
+        }
+
+        builder
     }
 }
 
@@ -135,10 +191,16 @@ impl StoreDriver for GCSStore {
                     };
 
                     match client.get_object(&req).await {
-                        Ok(metadata) => Ok(Some(metadata.size)),
+                        Ok(metadata) => match metadata.size.try_into() {
+                            Ok(size) => Ok(Some(size)),
+                            Err(_) => Err(make_err!(
+                                Code::Internal,
+                                "Invalid object size: {}",
+                                metadata.size
+                            )),
+                        },
                         Err(e) => {
                             if e.to_string().contains("404") {
-                                // Handle NotFound indirectly if possible
                                 Ok(None)
                             } else {
                                 Err(make_err!(
@@ -157,46 +219,6 @@ impl StoreDriver for GCSStore {
         }
 
         Ok(())
-    }
-
-    /// Creates a request for initiating a resumable upload session.
-    ///
-    /// This custom method mirrors `build_resumable_session_simple` from the
-    /// `google-cloud-storage` crate, which is currently inaccessible as it is
-    /// marked `pub(crate)`. If made public, this can be replaced.
-    ///
-    /// See: https://github.com/yoshidan/google-cloud-rust/issues/328
-    pub fn build_resumable_session_simple(
-        base_url: &str,
-        client: &Client,
-        req: &UploadObjectRequest,
-        media: &Media,
-    ) -> RequestBuilder {
-        let url = format!(
-            "{}/b/{}/o?uploadType=resumable",
-            base_url,
-            req.bucket.escape(),
-        );
-        let mut builder = client
-            .post(url)
-            .query(&req)
-            .query(&[("name", &media.name)])
-            .header(CONTENT_LENGTH, 0)
-            .header("X-Upload-Content-Type", media.content_type.to_string());
-        if let Some(len) = media.content_length {
-            builder = builder.header("X-Upload-Content-Length", len)
-        }
-        if let Some(encryption) = &req.encryption {
-            builder = builder
-                .header("x-goog-encryption-algorithm", encryption.algorithm.clone())
-                .header("x-goog-encryption-key", encryption.key.clone())
-                .header(
-                    "x-goog-encryption-key-sha256",
-                    encryption.key_sha256.clone(),
-                );
-        }
-
-        builder
     }
 
     /// Updates a file in GCS using resumable uploads.
@@ -235,7 +257,7 @@ impl StoreDriver for GCSStore {
             },
         };
 
-        let request_builder = build_resumable_session_simple(
+        let request_builder = GCSStore::build_resumable_session_simple(
             &self.gcs_client.base_url,
             &self.gcs_client.client(),
             &upload_request,
@@ -346,20 +368,22 @@ impl StoreDriver for GCSStore {
 
         let range = Range(
             Some(offset),
-            length
-                .and_then(|len| offset.checked_add(len))
-                .ok_or_else(|| {
-                    make_err!(
-                        Code::InvalidArgument,
-                        "Invalid range calculation for object: {}",
-                        object_name
-                    )
-                })?,
+            Some(
+                length
+                    .and_then(|len| offset.checked_add(len))
+                    .ok_or_else(|| {
+                        make_err!(
+                            Code::InvalidArgument,
+                            "Invalid range calculation for object: {}",
+                            object_name
+                        )
+                    })?,
+            ),
         );
 
-        self.retrier
-            .retry(async {
-                self.retry_count += 1;
+        let retry_stream = stream::unfold((), move |_| async {
+            self.retry_count += 1;
+            let result = async {
                 let mut stream = self
                     .gcs_client
                     .download_streamed_object(&req, &range)
@@ -370,6 +394,7 @@ impl StoreDriver for GCSStore {
                             "Failed to initiate streaming download from GCS: {e:?}"
                         )
                     })?;
+
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(chunk) => {
@@ -395,8 +420,13 @@ impl StoreDriver for GCSStore {
                     .map_err(|e| make_err!(Code::Internal, "Failed to send EOF: {e:?}"))?;
 
                 Ok::<(), Error>(())
-            })
-            .await
+            }
+            .await;
+
+            Some((RetryResult::from(result), ()))
+        });
+
+        self.retrier.retry(retry_stream).await?;
     }
 
     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
