@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,11 +67,11 @@ pub struct GCSStore {
     #[metric(help = "The key prefix used for objects in GCSStore")]
     key_prefix: String,
     #[metric(help = "Number of retry attempts in GCS operations")]
-    retry_count: usize,
+    retry_count: Arc<AtomicUsize>,
     #[metric(help = "Total bytes uploaded to GCS")]
-    uploaded_bytes: u64,
+    uploaded_bytes: Arc<AtomicU64>,
     #[metric(help = "Total bytes downloaded from GCS")]
-    downloaded_bytes: u64,
+    downloaded_bytes: Arc<AtomicU64>,
     gcs_client: Arc<Client>,
     retrier: Retrier,
 }
@@ -359,10 +360,11 @@ impl StoreDriver for GCSStore {
         length: Option<u64>,
     ) -> Result<(), Error> {
         let object_name = self.make_gcs_path(&key);
+        let object_name_clone = object_name.clone();
 
         let req = GetObjectRequest {
             bucket: self.bucket.clone(),
-            object: object_name,
+            object: object_name.clone(),
             ..Default::default()
         };
 
@@ -375,63 +377,74 @@ impl StoreDriver for GCSStore {
                         make_err!(
                             Code::InvalidArgument,
                             "Invalid range calculation for object: {}",
-                            object_name
+                            &object_name_clone
                         )
                     })?,
             ),
         );
 
-        let retry_stream = futures::stream::unfold((), move |_| async {
-            self.retry_count += 1;
-            let result = async {
-                let mut stream = self
-                    .gcs_client
-                    .download_streamed_object(&req, &range)
-                    .await
-                    .map_err(|e| {
-                        make_err!(
-                            Code::Unavailable,
-                            "Failed to initiate streaming download from GCS: {e:?}"
-                        )
-                    })?;
+        let self_arc = self.clone();
 
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            self.downloaded_bytes += chunk.len() as u64;
-                            writer.send(chunk).await.map_err(|e| {
-                                make_err!(
-                                    Code::Unavailable,
-                                    "Failed to write downloaded chunk: {e:?}"
-                                )
-                            })?;
-                        }
-                        Err(e) => {
-                            return Err(make_err!(
+        let retry_stream = futures::stream::unfold((), move |_| {
+            let self_arc = self_arc.clone();
+            let req = req.clone();
+            let range = range.clone();
+
+            async move {
+                self_arc.retry_count.fetch_add(1, Ordering::Relaxed);
+
+                let result = async {
+                    let mut stream = self_arc
+                        .gcs_client
+                        .download_streamed_object(&req, &range)
+                        .await
+                        .map_err(|e| {
+                            make_err!(
                                 Code::Unavailable,
-                                "Error during streaming download from GCS: {e:?}"
-                            ));
+                                "Failed to initiate streaming download from GCS: {e:?}"
+                            )
+                        })?;
+
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                self_arc
+                                    .downloaded_bytes
+                                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+
+                                writer.send(chunk).await.map_err(|e| {
+                                    make_err!(
+                                        Code::Unavailable,
+                                        "Failed to write downloaded chunk: {e:?}"
+                                    )
+                                })?;
+                            }
+                            Err(e) => {
+                                return Err(make_err!(
+                                    Code::Unavailable,
+                                    "Error during streaming download from GCS: {e:?}"
+                                ));
+                            }
                         }
                     }
+
+                    writer
+                        .send_eof()
+                        .map_err(|e| make_err!(Code::Internal, "Failed to send EOF: {e:?}"))?;
+
+                    Ok::<(), Error>(())
                 }
+                .await;
 
-                writer
-                    .send_eof()
-                    .map_err(|e| make_err!(Code::Internal, "Failed to send EOF: {e:?}"))?;
-
-                Ok::<(), Error>(())
-            }
-            .await;
-
-            match result {
-                Ok(()) => Some((RetryResult::Ok(()), ())),
-                Err(e) => Some((RetryResult::Retry(e), ())),
+                match result {
+                    Ok(()) => Some((RetryResult::Ok(()), ())),
+                    Err(e) => Some((RetryResult::Retry(e), ())),
+                }
             }
         });
 
         self.retrier.retry(retry_stream).await
     }
-
     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
         self
     }
