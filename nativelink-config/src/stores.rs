@@ -730,9 +730,9 @@ pub struct EvictionPolicy {
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct GCSSpec {
-    /// GCS bucket name to use as the backend.
+    /// Region name for GCS objects.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
-    pub bucket: String,
+    pub region: String,
 
     /// Optional key prefix for GCS objects.
     #[serde(default)]
@@ -741,6 +741,10 @@ pub struct GCSSpec {
     /// Bucket name to use as the backend.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub bucket: String,
+
+    /// Retry configuration to use when a network request fails.
+    #[serde(default)]
+    pub retry: Retry,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
