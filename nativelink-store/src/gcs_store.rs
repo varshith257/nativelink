@@ -69,14 +69,14 @@ impl GCSStore {
                 // Jitter: +/-50% random variation
                 // This helps distribute retries more evenly and prevents synchronized bursts.
                 // Reference: https://cloud.google.com/storage/docs/retry-strategy#exponential-backoff
-                let jitter = rand::random::<f32>() * 0.5;
+                let jitter = rand::random::<f32>() * (spec.retry.jitter / 2.0);
                 let backoff_with_jitter = duration.mul_f32(1.0 + jitter);
                 Box::pin(tokio::time::sleep(backoff_with_jitter))
             }),
             Arc::new(|delay| {
                 // Exponential backoff: Multiply delay by 2, with an upper cap
-                let max_delay = Duration::from_secs(30);
-                delay.mul_f32(2.0).min(max_delay)
+                let exponential_backoff = delay.mul_f32(2.0);
+                Duration::from_secs_f32(spec.retry.delay).min(exponential_backoff)
             }),
             spec.retry.clone(),
         );
