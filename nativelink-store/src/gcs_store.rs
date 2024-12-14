@@ -84,23 +84,23 @@ impl GCSStore {
             .map(Arc::new)
             .map_err(|e| make_err!(Code::Unavailable, "Failed to initialize GCS client: {e:?}"))?;
 
-        let retry_config = spec.retry.clone();
+        let retry_config_clone = spec.retry.clone();
 
         let retrier = Retrier::new(
             Arc::new(move |duration| {
                 // Jitter: +/-50% random variation
                 // This helps distribute retries more evenly and prevents synchronized bursts.
                 // Reference: https://cloud.google.com/storage/docs/retry-strategy#exponential-backoff
-                let jitter = random::<f32>() * (retry_config.jitter / 2.0);
+                let jitter = random::<f32>() * (retry_config_clone.jitter / 2.0);
                 let backoff_with_jitter = duration.mul_f32(1.0 + jitter);
                 Box::pin(tokio::time::sleep(backoff_with_jitter))
             }),
             Arc::new(|delay| {
                 // Exponential backoff: Multiply delay by 2, with an upper cap
                 let exponential_backoff = delay.mul_f32(2.0);
-                Duration::from_secs_f32(retry_config.delay).min(exponential_backoff)
+                Duration::from_secs_f32(spec.retry.delay).min(exponential_backoff)
             }),
-            retry_config,
+            spec.retry.clone(),
         );
 
         Ok(Arc::new(Self {
@@ -381,7 +381,7 @@ impl StoreDriver for GCSStore {
             ),
         );
 
-        let retry_stream = stream::unfold((), move |_| async {
+        let retry_stream = futures::stream::unfold((), move |_| async {
             self.retry_count += 1;
             let result = async {
                 let mut stream = self
@@ -423,10 +423,13 @@ impl StoreDriver for GCSStore {
             }
             .await;
 
-            Some((RetryResult::from(result), ()))
+            match result {
+                Ok(()) => Some((RetryResult::Ok(()), ())),
+                Err(e) => Some((RetryResult::Retry(e), ())),
+            }
         });
 
-        self.retrier.retry(retry_stream).await?;
+        self.retrier.retry(retry_stream).await
     }
 
     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
