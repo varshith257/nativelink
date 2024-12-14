@@ -23,7 +23,6 @@ use bytes::Bytes;
 use futures::future::FusedFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
-
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
