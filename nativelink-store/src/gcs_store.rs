@@ -12,11 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::FusedFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
+use rand::random;
 
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error, ResultExt};
@@ -28,22 +35,15 @@ use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
-use serde::{Deserialize, Serialize};
 
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
 use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
 use google_cloud_storage::Error as GcsError;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{event, Level};
-
-use rand::random;
-use std::borrow::Cow;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
 
 // Minimum and maximum size for GCS multipart uploads.
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024;
