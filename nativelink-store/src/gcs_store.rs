@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::stream;
 use futures::stream::unfold;
 use futures::stream::FuturesUnordered;
 use futures::stream::Stream;
@@ -43,7 +44,8 @@ use rand::random;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
-use tokio::sync::broadcast::{Receiver, RecvError};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::Receiver;
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
@@ -72,15 +74,18 @@ impl<T: Clone> BroadcastStream<T> {
     }
 }
 
-impl<T: Clone> Stream for BroadcastStream<T> {
+impl<T: Clone + Send + 'static> Stream for BroadcastStream<T> {
     type Item = Result<T, RecvError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.receiver.recv() {
-            Ok(value) => Poll::Ready(Some(Ok(value))),
-            Err(RecvError::Closed) => Poll::Ready(None),
-            Err(e) => Poll::Ready(Some(Err(e))),
+        let recv_future = this.receiver.recv();
+
+        match Box::pin(recv_future).as_mut().poll(cx) {
+            Poll::Ready(Ok(value)) => Poll::Ready(Some(Ok(value))),
+            Poll::Ready(Err(RecvError::Closed)) => Poll::Ready(None),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -325,7 +330,7 @@ impl StoreDriver for GCSStore {
             let reader_clone = Arc::clone(&reader);
             let tx = tx.clone();
             tokio::spawn(async move {
-                let mut buffer = vec![0u8; 64 * 1024];
+                let buffer = vec![0u8; 64 * 1024];
                 let mut reader = reader_clone.lock().await;
 
                 loop {
@@ -355,7 +360,13 @@ impl StoreDriver for GCSStore {
         ) -> Result<(), Error> {
             let mut rx = tx.subscribe();
 
-            let body = Body::wrap_stream(BroadcastStream::new(rx));
+            let body = Body::wrap_stream(BroadcastStream::new(rx).map(|res| {
+                res.map_err(|e| {
+                    debug!("Stream error: {:?}", e);
+                    std::io::Error::new(std::io::ErrorKind::Other, "Stream failed")
+                })
+                .unwrap_or_else(|_| bytes::Bytes::new())
+            }));
 
             match resumable_client.status(None).await? {
                 UploadStatus::NotStarted => {
@@ -403,10 +414,19 @@ impl StoreDriver for GCSStore {
         }
 
         self.retrier
-            .retry(unfold(tx.clone(), move |tx| async move {
-                let retry_result =
-                    match retry_upload(&tx, &resumable_client, Arc::clone(&object_name), file_size)
-                        .await
+            .retry(unfold(tx.clone(), move |tx| {
+                let resumable_client = resumable_client.clone();
+                let object_name = Arc::clone(&object_name);
+                let reader = Arc::clone(&reader);
+
+                async move {
+                    let retry_result = match retry_upload(
+                        &tx,
+                        &resumable_client,
+                        Arc::clone(&object_name),
+                        file_size,
+                    )
+                    .await
                     {
                         Ok(_) => RetryResult::Ok(()),
                         Err(e) => {
@@ -422,7 +442,8 @@ impl StoreDriver for GCSStore {
                         }
                     };
 
-                Some((retry_result, tx))
+                    Some((retry_result, tx))
+                }
             }))
             .await?;
 
