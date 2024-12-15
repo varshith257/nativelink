@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use futures::stream;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
+use futures::stream::unfold;
 use futures::StreamExt;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
