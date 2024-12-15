@@ -210,24 +210,32 @@ impl StoreDriver for GCSStore {
         let session_url = self
             .retrier
             .retry(stream::once(async {
-                let request_builder =
-                    google_cloud_storage::http::objects::upload::build_resumable_session_simple(
-                        &self.gcs_client.base_url,
-                        &self.gcs_client.http,
-                        &upload_request,
-                        &media,
-                    );
-                let response = self.gcs_client.send(request_builder.build()?).await?;
-                response
-                    .headers()
-                    .get("location")
-                    .ok_or_else(|| make_err!(Code::Unavailable, "No session URL in response"))
-                    .and_then(|value| {
-                        value
-                            .to_str()
-                            .map(|url| RetryResult::Ok(url.to_string()))
-                            .map_err(|e| make_err!(Code::Internal, "Invalid URL: {e:?}"))
-                    })
+                let result = async {
+                    let request_builder =
+                        google_cloud_storage::http::objects::upload::build_resumable_session_simple(
+                            &self.gcs_client.base_url,
+                            &self.gcs_client.http,
+                            &upload_request,
+                            &media,
+                        );
+                    let response = self.gcs_client.send(request_builder.build()?).await?;
+                    response
+                        .headers()
+                        .get("location")
+                        .ok_or_else(|| make_err!(Code::Unavailable, "No session URL in response"))
+                        .and_then(|value| {
+                            value
+                                .to_str()
+                                .map(|url| RetryResult::Ok(url.to_string()))
+                                .map_err(|e| make_err!(Code::Internal, "Invalid URL: {e:?}"))
+                        })
+                }
+                .await;
+
+                match result {
+                    Ok(url) => RetryResult::Ok(url),
+                    Err(e) => RetryResult::Retry(e),
+                }
             }))
             .await?;
 
@@ -253,22 +261,30 @@ impl StoreDriver for GCSStore {
 
             self.retrier
                 .retry(stream::once(async {
-                    let chunk_request = self
-                        .gcs_client
-                        .http
-                        .put(&session_url)
-                        .body(chunk_data.clone())
-                        .header("Content-Range", upload_range.clone());
+                    let result = async {
+                        let chunk_request = self
+                            .gcs_client
+                            .http
+                            .put(&session_url)
+                            .body(chunk_data.clone())
+                            .header("Content-Range", upload_range.clone());
 
-                    let response = chunk_request.send().await?;
-                    if response.status().is_success() || response.status().as_u16() == 308 {
-                        Ok::<(), Error>(())
-                    } else {
-                        Err(make_err!(
-                            Code::Unavailable,
-                            "Chunk upload failed: HTTP {}",
-                            response.status()
-                        ))
+                        let response = chunk_request.send().await?;
+                        if response.status().is_success() || response.status().as_u16() == 308 {
+                            Ok::<(), Error>(())
+                        } else {
+                            Err(make_err!(
+                                Code::Unavailable,
+                                "Chunk upload failed: HTTP {}",
+                                response.status()
+                            ))
+                        }
+                    }
+                    .await;
+
+                    match result {
+                        Ok(_) => RetryResult::Ok(()),
+                        Err(e) => RetryResult::Retry(e),
                     }
                 }))
                 .await?;
@@ -299,28 +315,36 @@ impl StoreDriver for GCSStore {
 
         self.retrier
             .retry(stream::once(async {
-                let mut stream = self
-                    .gcs_client
-                    .download_streamed_object(&req, &range)
-                    .await
-                    .map_err(|e| {
-                        make_err!(Code::Unavailable, "Failed to initiate download: {e:?}")
-                    })?;
-
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| {
-                        make_err!(Code::Unavailable, "Failed to download chunk: {e:?}")
-                    })?;
-                    writer
-                        .send(chunk)
+                let result = async {
+                    let mut stream = self
+                        .gcs_client
+                        .download_streamed_object(&req, &range)
                         .await
-                        .map_err(|e| make_err!(Code::Unavailable, "Write error: {e:?}"))?;
-                }
+                        .map_err(|e| {
+                            make_err!(Code::Unavailable, "Failed to initiate download: {e:?}")
+                        })?;
 
-                writer
-                    .send_eof()
-                    .map_err(|e| make_err!(Code::Internal, "EOF error: {e:?}"))?;
-                Ok::<(), Error>(())
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk.map_err(|e| {
+                            make_err!(Code::Unavailable, "Failed to download chunk: {e:?}")
+                        })?;
+                        writer
+                            .send(chunk)
+                            .await
+                            .map_err(|e| make_err!(Code::Unavailable, "Write error: {e:?}"))?;
+                    }
+
+                    writer
+                        .send_eof()
+                        .map_err(|e| make_err!(Code::Internal, "EOF error: {e:?}"))?;
+                    Ok::<(), Error>(())
+                }
+                .await;
+
+                match result {
+                    Ok(_) => RetryResult::Ok(()),
+                    Err(e) => RetryResult::Retry(e),
+                }
             }))
             .await?;
 
