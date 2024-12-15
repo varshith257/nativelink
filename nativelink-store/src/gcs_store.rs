@@ -41,7 +41,7 @@ use rand::random;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::Body;
 use reqwest::Client as ReqwestClient;
-use reqwest_middleware::{ClientWithMiddleware, Middleware, RequestBuilder};
+use reqwest_middleware::{ClientWithMiddleware, Middleware};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
@@ -285,7 +285,10 @@ impl StoreDriver for GCSStore {
 
         let client_with_middleware =
             ClientWithMiddleware::new(reqwest_client, Vec::<Arc<dyn Middleware>>::new());
+
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
+
+        let reader_arc = Arc::new(Mutex::new(reader));
 
         self.retrier
             .retry(stream::once(async {
@@ -327,9 +330,10 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                let stream_reader = StreamReader::new(reader.map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                                }));
+                                let stream_reader =
+                                    StreamReader::new(reader_arc.clone().lock().await.map_err(
+                                        |e| std::io::Error::new(std::io::ErrorKind::Other, e),
+                                    ));
                                 let body = Body::wrap_stream(ReaderStream::new(stream_reader));
 
                                 resumable_client
