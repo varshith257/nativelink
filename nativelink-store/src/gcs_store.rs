@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use google_cloud_storage::client::{Client, ClientConfig};
@@ -34,8 +33,6 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::random;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use reqwest_middleware::{ClientWithMiddleware as GCSClient, RequestBuilder};
 use tracing::debug;
 
 // Minimum and maximum size for GCS multipart uploads.
@@ -68,21 +65,22 @@ impl GCSStore {
             .map(Arc::new)
             .map_err(|e| make_err!(Code::Unavailable, "Failed to initialize GCS client: {e:?}"))?;
 
-        let retry_config_clone = spec.retry.clone();
+        let retry_jitter = spec.retry.jitter;
+        let retry_delay = spec.retry.delay;
 
         let retrier = Retrier::new(
             Arc::new(move |duration| {
                 // Jitter: +/-50% random variation
                 // This helps distribute retries more evenly and prevents synchronized bursts.
                 // Reference: https://cloud.google.com/storage/docs/retry-strategy#exponential-backoff
-                let jitter = random::<f32>() * (retry_config_clone.jitter / 2.0);
+                let jitter = random::<f32>() * (retry_jitter / 2.0);
                 let backoff_with_jitter = duration.mul_f32(1.0 + jitter);
                 Box::pin(tokio::time::sleep(backoff_with_jitter))
             }),
             Arc::new(|delay| {
                 // Exponential backoff: Multiply delay by 2, with an upper cap
                 let exponential_backoff = delay.mul_f32(2.0);
-                Duration::from_secs_f32(spec.retry.delay).min(exponential_backoff)
+                Duration::from_secs_f32(retry_delay).min(exponential_backoff)
             }),
             spec.retry.clone(),
         );
@@ -109,39 +107,40 @@ impl GCSStore {
     /// marked `pub(crate)`. If made public, this can be replaced.
     ///
     /// See: https://github.com/yoshidan/google-cloud-rust/issues/328
-//     fn build_resumable_session_simple(
-//         base_url: &str,
-//         client: &Client,
-//         req: &UploadObjectRequest,
-//         media: &Media,
-//     ) -> RequestBuilder {
-//         let url = format!(
-//             "{}/b/{}/o?uploadType=resumable",
-//             base_url,
-//             req.bucket.escape(),
-//         );
-//         let mut builder = GCSClient
-//             .post(url)
-//             .query(&req)
-//             .query(&[("name", &media.name)])
-//             .header(CONTENT_LENGTH, 0)
-//             .header("X-Upload-Content-Type", media.content_type.to_string());
+    todo!();
+    //     fn build_resumable_session_simple(
+    //         base_url: &str,
+    //         client: &Client,
+    //         req: &UploadObjectRequest,
+    //         media: &Media,
+    //     ) -> RequestBuilder {
+    //         let url = format!(
+    //             "{}/b/{}/o?uploadType=resumable",
+    //             base_url,
+    //             req.bucket.escape(),
+    //         );
+    //         let mut builder = GCSClient
+    //             .post(url)
+    //             .query(&req)
+    //             .query(&[("name", &media.name)])
+    //             .header(CONTENT_LENGTH, 0)
+    //             .header("X-Upload-Content-Type", media.content_type.to_string());
 
-//         if let Some(len) = media.content_length {
-//             builder = builder.header("X-Upload-Content-Length", len)
-//         }
-//         if let Some(encryption) = &req.encryption {
-//             builder = builder
-//                 .header("x-goog-encryption-algorithm", encryption.algorithm.clone())
-//                 .header("x-goog-encryption-key", encryption.key.clone())
-//                 .header(
-//                     "x-goog-encryption-key-sha256",
-//                     encryption.key_sha256.clone(),
-//                 );
-//         }
+    //         if let Some(len) = media.content_length {
+    //             builder = builder.header("X-Upload-Content-Length", len)
+    //         }
+    //         if let Some(encryption) = &req.encryption {
+    //             builder = builder
+    //                 .header("x-goog-encryption-algorithm", encryption.algorithm.clone())
+    //                 .header("x-goog-encryption-key", encryption.key.clone())
+    //                 .header(
+    //                     "x-goog-encryption-key-sha256",
+    //                     encryption.key_sha256.clone(),
+    //                 );
+    //         }
 
-//         builder
-//     }
+    //         builder
+    //     }
 }
 
 #[async_trait]
@@ -213,7 +212,7 @@ impl StoreDriver for GCSStore {
     /// For best practices, ensure that session URLs are stored if uploads may need to resume later.
     /// Reference: https://cloud.google.com/storage/docs/resumable-uploads
     async fn update(
-        self: Pin<&Self>,
+        self: Arc<Self>,
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
@@ -227,13 +226,11 @@ impl StoreDriver for GCSStore {
 
         let upload_request = UploadObjectRequest {
             bucket: self.bucket.clone(),
-            object: object_name.clone(),
             ..Default::default()
         };
 
         debug!("Starting upload to GCS for object: {}", object_name);
 
-        let mut bytes_uploaded = 0;
         let media = Media {
             name: object_name.clone().into(),
             content_type: "application/octet-stream".into(),
@@ -245,7 +242,7 @@ impl StoreDriver for GCSStore {
 
         let session_url = self
             .retrier
-            .retry(async {
+            .retry(stream::once(async {
                 let request_builder =
                     google_cloud_storage::http::objects::upload::build_resumable_session_simple(
                         &self.gcs_client.base_url,
@@ -257,83 +254,73 @@ impl StoreDriver for GCSStore {
                 response
                     .headers()
                     .get("location")
-                    .ok_or_else(|| {
-                        make_err!(Code::Unavailable, "Failed to get resumable session URL")
-                    })
+                    .ok_or_else(|| make_err!(Code::Unavailable, "No session URL in response"))
                     .and_then(|value| {
                         value
                             .to_str()
+                            .map(|url| RetryResult::Ok(url.to_string()))
                             .map_err(|e| make_err!(Code::Internal, "Invalid URL: {e:?}"))
                     })
-                    .map(|url| url.to_string())
-            })
+            }))
             .await?;
 
         let mut buffer = vec![0; buffer_size];
         let mut offset = 0;
 
         loop {
-            let bytes_read = reader
-                .read(&mut buffer)
+            let chunk_data = reader
+                .consume(Some(buffer_size))
                 .await
-                .map_err(|e| make_err!(Code::Unavailable, "Failed to read input stream: {e:?}"))?;
+                .map_err(|e| make_err!(Code::Unavailable, "Read error: {e:?}"))?;
 
-            if bytes_read == 0 {
+            if chunk_data.is_empty() {
                 break;
             }
 
-            let chunk_data = &buffer[..bytes_read];
             let upload_range = format!(
                 "bytes {}-{}/{}",
                 offset,
-                offset + bytes_read as u64 - 1,
+                offset + chunk_data.len() as u64 - 1,
                 "*"
             );
 
-            debug!(
-                "Uploading chunk: offset={}, size={}, range={}",
-                offset, bytes_read, upload_range
-            );
-
             self.retrier
-                .retry(async {
+                .retry(stream::once(async {
                     let chunk_request = self
                         .gcs_client
                         .http
                         .put(&session_url)
-                        .body(chunk_data.to_vec())
+                        .body(chunk_data.clone())
                         .header("Content-Range", upload_range.clone());
+
                     let response = chunk_request.send().await?;
                     if response.status().is_success() || response.status().as_u16() == 308 {
                         Ok::<(), Error>(())
                     } else {
                         Err(make_err!(
                             Code::Unavailable,
-                            "Failed to upload chunk: HTTP {}",
+                            "Chunk upload failed: HTTP {}",
                             response.status()
                         ))
                     }
-                })
+                }))
                 .await?;
 
-            offset += bytes_read as u64;
+            offset += chunk_data.len() as u64;
         }
 
-        debug!("Upload to GCS completed for object: {}", object_name);
-
+        debug!("Upload completed for object: {}", object_name);
         Ok(())
     }
 
-
     async fn get_part(
-        self: Pin<&Self>,
+        self: Arc<Self>,
         key: StoreKey<'_>,
         writer: &mut DropCloserWriteHalf,
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
         let object_name = self.make_gcs_path(&key);
-        let object_name_clone = object_name.clone();
 
         let req = GetObjectRequest {
             bucket: self.bucket.clone(),
@@ -341,83 +328,38 @@ impl StoreDriver for GCSStore {
             ..Default::default()
         };
 
-        let range = Range(
-            Some(offset),
-            Some(
-                length
-                    .and_then(|len| offset.checked_add(len))
-                    .ok_or_else(|| {
-                        make_err!(
-                            Code::InvalidArgument,
-                            "Invalid range calculation for object: {}",
-                            &object_name_clone
-                        )
-                    })?,
-            ),
-        );
+        let range = Range(Some(offset), length.map(|len| offset + len));
 
-        let self_arc = self.clone();
+        self.retrier
+            .retry(stream::once(async {
+                let mut stream = self
+                    .gcs_client
+                    .download_streamed_object(&req, &range)
+                    .await
+                    .map_err(|e| {
+                        make_err!(Code::Unavailable, "Failed to initiate download: {e:?}")
+                    })?;
 
-        let retry_stream = futures::stream::unfold((), move |_| {
-            let self_arc = self_arc.clone();
-            let req = req.clone();
-            let range = range.clone();
-
-            async move {
-                self_arc.retry_count.fetch_add(1, Ordering::Relaxed);
-
-                let result = async {
-                    let mut stream = self_arc
-                        .gcs_client
-                        .download_streamed_object(&req, &range)
-                        .await
-                        .map_err(|e| {
-                            make_err!(
-                                Code::Unavailable,
-                                "Failed to initiate streaming download from GCS: {e:?}"
-                            )
-                        })?;
-
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                self_arc
-                                    .downloaded_bytes
-                                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-
-                                writer.send(chunk).await.map_err(|e| {
-                                    make_err!(
-                                        Code::Unavailable,
-                                        "Failed to write downloaded chunk: {e:?}"
-                                    )
-                                })?;
-                            }
-                            Err(e) => {
-                                return Err(make_err!(
-                                    Code::Unavailable,
-                                    "Error during streaming download from GCS: {e:?}"
-                                ));
-                            }
-                        }
-                    }
-
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| {
+                        make_err!(Code::Unavailable, "Failed to download chunk: {e:?}")
+                    })?;
                     writer
-                        .send_eof()
-                        .map_err(|e| make_err!(Code::Internal, "Failed to send EOF: {e:?}"))?;
-
-                    Ok::<(), Error>(())
+                        .send(chunk)
+                        .await
+                        .map_err(|e| make_err!(Code::Unavailable, "Write error: {e:?}"))?;
                 }
-                .await;
 
-                match result {
-                    Ok(()) => Some((RetryResult::Ok(()), ())),
-                    Err(e) => Some((RetryResult::Retry(e), ())),
-                }
-            }
-        });
+                writer
+                    .send_eof()
+                    .map_err(|e| make_err!(Code::Internal, "EOF error: {e:?}"))?;
+                Ok::<(), Error>(())
+            }))
+            .await?;
 
-        self.retrier.retry(retry_stream).await
+        Ok(())
     }
+
     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
         self
     }

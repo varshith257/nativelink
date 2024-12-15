@@ -2423,6 +2423,7 @@ dependencies = [
  "nativelink-util",
  "parking_lot",
  "patricia_tree",
+ "percent-encoding",
  "pretty_assertions",
  "prost",
  "rand",
