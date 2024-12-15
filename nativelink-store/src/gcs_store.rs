@@ -424,7 +424,7 @@ impl StoreDriver for GCSStore {
         self.retrier
             .retry(unfold(tx.clone(), {
                 let resumable_client = resumable_client.clone();
-                let object_name = Arc::clone(&object_name);
+                let object_name_clone = Arc::clone(&object_name);
                 let reader = Arc::clone(&reader);
 
                 move |tx| {
