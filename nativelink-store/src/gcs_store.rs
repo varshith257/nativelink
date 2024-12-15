@@ -21,10 +21,13 @@ use async_trait::async_trait;
 use futures::stream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use google_cloud_storage::client::ClientWithMiddleware as Client;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
+use google_cloud_storage::http::objects::upload::ChunkSize;
 use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest};
+use google_cloud_storage::http::resumable_upload_client::ResumableUploadClient;
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error};
 use nativelink_metric::MetricsComponent;
@@ -36,19 +39,17 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::random;
 use tracing::debug;
 
-// Minimum and maximum size for GCS multipart uploads.
+// Minimum size for GCS multipart uploads.
+// Note: If you change this, adjust the docs in the config.
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024;
 
+// Maximum size for GCS multipart uploads.
+// Note: If you change this, adjust the docs in the config.
 const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Creates a request for initiating a resumable upload session.
-///
-/// This custom method mirrors `build_resumable_session_simple` from the
-/// `google-cloud-storage` crate, which is currently inaccessible as it is
-/// marked `pub(crate)`. If made public, this can be replaced.
-///
-/// See: https://github.com/yoshidan/google-cloud-rust/issues/328
-///
+// Note: If you change this, adjust the docs in the config.
+const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
 #[derive(MetricsComponent)]
 pub struct GCSStore {
     #[metric(help = "The bucket name used for GCSStore")]
@@ -186,111 +187,77 @@ impl StoreDriver for GCSStore {
     ) -> Result<(), Error> {
         let object_name = self.make_gcs_path(&key);
 
-        let buffer_size = match upload_size {
-            UploadSizeInfo::ExactSize(size) => size.min(MIN_MULTIPART_SIZE).max(64 * 1024),
-            _ => MIN_MULTIPART_SIZE,
+        let file_size = match upload_size {
+            UploadSizeInfo::ExactSize(size) => size,
+            _ => return Err(make_err!(Code::InvalidArgument, "Unknown file size")),
         } as usize;
-
-        let upload_request = UploadObjectRequest {
-            bucket: self.bucket.clone(),
-            ..Default::default()
-        };
 
         debug!("Starting upload to GCS for object: {}", object_name);
 
-        let media = Media {
-            name: object_name.clone().into(),
-            content_type: "application/octet-stream".into(),
-            content_length: match upload_size {
-                UploadSizeInfo::ExactSize(size) => Some(size),
-                _ => None,
-            },
-        };
-
         let session_url = self
-            .retrier
+            .gcs_client
+            .start_resumable_upload(&UploadObjectRequest {
+                bucket: self.bucket.clone(),
+                object: object_name.clone(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}"))?;
+        let resumable_client =
+            ResumableUploadClient::new(session_url.clone(), self.gcs_client.clone());
+
+        self.retrier
             .retry(stream::once(async {
                 let result = async {
-                    let request_builder =
-                        google_cloud_storage::http::objects::upload::build_resumable_session_simple(
-                            &self.gcs_client.base_url,
-                            &self.gcs_client.http,
-                            &upload_request,
-                            &media,
-                        );
-                    let response = self.gcs_client.send(request_builder.build()?).await?;
-                    response
-                        .headers()
-                        .get("location")
-                        .ok_or_else(|| make_err!(Code::Unavailable, "No session URL in response"))
-                        .and_then(|value| {
-                            value
-                                .to_str()
-                                .map(|url| RetryResult::Ok(url.to_string()))
-                                .map_err(|e| make_err!(Code::Internal, "Invalid URL: {e:?}"))
-                        })
+                    match resumable_client.status(None).await? {
+                        UploadStatus::NotStarted => {
+                            // Single chunk upload for small files
+                            resumable_client
+                                .upload_single_chunk(reader.clone(), file_size as usize)
+                                .await?;
+                        }
+                        UploadStatus::ResumeIncomplete(range) => {
+                            // Resumable chunked upload for large files
+                            let total_size = range.total_size.unwrap_or(file_size);
+                            let mut current_position = range.last_uploaded_byte.unwrap_or(0);
+
+                            while current_position < total_size {
+                                let chunk_size = ChunkSize::new(
+                                    current_position,
+                                    (current_position + DEFAULT_CHUNK_SIZE - 1).min(total_size - 1),
+                                    Some(total_size),
+                                );
+
+                                debug!(
+                                    "Uploading chunk: {}-{} for object: {}",
+                                    chunk_size.first_byte, chunk_size.last_byte, object_name
+                                );
+
+                                resumable_client
+                                    .upload_multiple_chunk(&mut reader, &chunk_size)
+                                    .await?;
+
+                                current_position += chunk_size.size();
+                            }
+                        }
+                        UploadStatus::Ok(_) => {
+                            debug!("Upload completed!");
+                            return Ok(());
+                        }
+                    }
+                    Ok::<(), Error>(())
                 }
                 .await;
 
                 match result {
-                    Ok(url) => RetryResult::Ok(url),
-                    Err(e) => RetryResult::Retry(e),
+                    Ok(_) => RetryResult::Ok(()),
+                    Err(e) => {
+                        debug!("Retryable upload error: {:?}", e);
+                        RetryResult::Retry(e)
+                    }
                 }
             }))
             .await?;
-
-        let mut buffer = vec![0; buffer_size];
-        let mut offset = 0;
-
-        loop {
-            let chunk_data = reader
-                .consume(Some(buffer_size))
-                .await
-                .map_err(|e| make_err!(Code::Unavailable, "Read error: {e:?}"))?;
-
-            if chunk_data.is_empty() {
-                break;
-            }
-
-            let upload_range = format!(
-                "bytes {}-{}/{}",
-                offset,
-                offset + chunk_data.len() as u64 - 1,
-                "*"
-            );
-
-            self.retrier
-                .retry(stream::once(async {
-                    let result = async {
-                        let chunk_request = self
-                            .gcs_client
-                            .http
-                            .put(&session_url)
-                            .body(chunk_data.clone())
-                            .header("Content-Range", upload_range.clone());
-
-                        let response = chunk_request.send().await?;
-                        if response.status().is_success() || response.status().as_u16() == 308 {
-                            Ok::<(), Error>(())
-                        } else {
-                            Err(make_err!(
-                                Code::Unavailable,
-                                "Chunk upload failed: HTTP {}",
-                                response.status()
-                            ))
-                        }
-                    }
-                    .await;
-
-                    match result {
-                        Ok(_) => RetryResult::Ok(()),
-                        Err(e) => RetryResult::Retry(e),
-                    }
-                }))
-                .await?;
-
-            offset += chunk_data.len() as u64;
-        }
 
         debug!("Upload completed for object: {}", object_name);
         Ok(())
