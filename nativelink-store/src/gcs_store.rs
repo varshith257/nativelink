@@ -43,7 +43,7 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
-use tokio::sync::{mpsc, Mutex, MutexGuard};
+use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
@@ -291,26 +291,29 @@ impl StoreDriver for GCSStore {
 
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, Error>>(10);
+        let (tx, _) = broadcast::channel::<Result<bytes::Bytes, Error>>(10);
 
         // Spawn a task to read data and send it to the channel
-        tokio::spawn(async move {
-            let mut buffer = vec![0u8; 64 * 1024];
-            loop {
-                match reader.consume(Some(buffer.len())).await {
-                    Ok(bytes) => {
-                        if bytes.is_empty() {
+        tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                let mut buffer = vec![0u8; 64 * 1024];
+                loop {
+                    match reader.consume(Some(buffer.len())).await {
+                        Ok(bytes) => {
+                            if bytes.is_empty() {
+                                break;
+                            }
+                            if tx.send(Ok(bytes.into())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
+                                .await;
                             break;
                         }
-                        if tx.send(Ok(bytes.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
-                            .await;
-                        break;
                     }
                 }
             }
@@ -321,8 +324,8 @@ impl StoreDriver for GCSStore {
                 let result = async {
                     match resumable_client.status(None).await? {
                         UploadStatus::NotStarted => {
+                            let mut rx = tx.subscribe();
                             let body = Body::wrap_stream(ReceiverStream::new(rx));
-
                             // Single chun upload for small files
                             resumable_client
                                 .upload_single_chunk(body, file_size as usize)
@@ -352,34 +355,8 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                // Re-create the receiver for retries
-                                let (tx, mut rx) =
-                                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, Error>>(10);
-                                tokio::spawn(async move {
-                                    let mut buffer = vec![0u8; 64 * 1024];
-                                    loop {
-                                        match reader.consume(Some(buffer.len())).await {
-                                            Ok(bytes) => {
-                                                if bytes.is_empty() {
-                                                    break;
-                                                }
-                                                if tx.send(Ok(bytes.into())).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let _ = tx
-                                                    .send(Err(make_err!(
-                                                        Code::Unavailable,
-                                                        "Read error: {e:?}"
-                                                    )))
-                                                    .await;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                });
-
+                                // Subscribe to the same broadcast channel for retries
+                                let mut rx = tx.subscribe();
                                 let body = Body::wrap_stream(ReceiverStream::new(rx));
 
                                 resumable_client
