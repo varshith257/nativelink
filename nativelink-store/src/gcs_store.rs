@@ -41,6 +41,7 @@ use rand::random;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
+use tokio::io::DuplexStream;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
@@ -288,20 +289,21 @@ impl StoreDriver for GCSStore {
 
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
-        let reader_arc = Arc::new(Mutex::new(reader));
-
+        let (stream_writer, stream_reader) = DuplexStream::pair();
+        tokio::spawn(async move {
+            let mut stream_writer = stream_writer;
+            tokio::io::copy(&mut reader, &mut stream_writer)
+                .await
+                .expect("Failed to write to duplex stream");
+        });
         self.retrier
             .retry(stream::once(async {
                 let result = async {
                     match resumable_client.status(None).await? {
                         UploadStatus::NotStarted => {
-                            // Lock the reader for single-chunk upload
-                            let reader_guard = reader_arc.lock().await;
-                            let stream_reader = StreamReader::new(&mut *reader_guard);
-
                             let body = Body::wrap_stream(ReaderStream::new(stream_reader));
 
-                            // Single chunk upload for small files
+                            // Single chun upload for small files
                             resumable_client
                                 .upload_single_chunk(body, file_size as usize)
                                 .await
@@ -330,10 +332,8 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                let mut reader_guard = reader_arc.lock().await;
-                                let stream_reader = StreamReader::new(&mut *reader_guard);
-
-                                let body = Body::wrap_stream(ReaderStream::new(stream_reader));
+                                let body =
+                                    Body::wrap_stream(ReaderStream::new(stream_reader.clone()));
 
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
