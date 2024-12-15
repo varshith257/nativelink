@@ -21,13 +21,13 @@ use async_trait::async_trait;
 use futures::stream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use google_cloud_storage::client::ClientWithMiddleware as Client;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
-use google_cloud_storage::http::objects::upload::ChunkSize;
 use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest};
+use google_cloud_storage::http::resumable_upload_client::ChunkSize;
 use google_cloud_storage::http::resumable_upload_client::ResumableUploadClient;
+use google_cloud_storage::http::resumable_upload_client::UploadStatus;
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error};
 use nativelink_metric::MetricsComponent;
@@ -37,6 +37,7 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::random;
+use reqwest::header::{HeaderValue, LOCATION};
 use tracing::debug;
 
 // Minimum size for GCS multipart uploads.
@@ -108,6 +109,48 @@ impl GCSStore {
     }
     fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
         format!("{}{}", self.key_prefix, key.as_str())
+    }
+
+    pub async fn start_resumable_upload(
+        &self,
+        bucket: &str,
+        object_name: &str,
+        content_length: Option<u64>,
+    ) -> Result<ResumableUploadClient, Error> {
+        let media = Media {
+            name: object_name.into(),
+            content_type: "application/octet-stream".into(),
+            content_length,
+        };
+
+        let request = build_resumable_session_simple(
+            "https://storage.googleapis.com",
+            client,
+            &UploadObjectRequest {
+                bucket: bucket.to_string(),
+                ..Default::default()
+            },
+            &media,
+        );
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}"))?;
+
+        if let Some(location) = response.headers().get(LOCATION) {
+            let session_url = location
+                .to_str()
+                .map_err(|_| make_err!(Code::Unavailable, "Invalid session URL"))?
+                .to_string();
+
+            Ok(ResumableUploadClient::new(session_url, client.clone()))
+        } else {
+            Err(make_err!(
+                Code::Unavailable,
+                "No Location header in response"
+            ))
+        }
     }
 }
 
@@ -195,14 +238,10 @@ impl StoreDriver for GCSStore {
         debug!("Starting upload to GCS for object: {}", object_name);
 
         let session_url = self
-            .gcs_client
-            .start_resumable_upload(&UploadObjectRequest {
-                bucket: self.bucket.clone(),
-                object: object_name.clone(),
-                ..Default::default()
-            })
+            .start_resumable_upload(&self.bucket, &object_name, Some(file_size as u64))
             .await
             .map_err(|e| make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}"))?;
+
         let resumable_client =
             ResumableUploadClient::new(session_url.clone(), self.gcs_client.clone());
 
