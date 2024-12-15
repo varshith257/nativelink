@@ -297,11 +297,9 @@ impl StoreDriver for GCSStore {
                         UploadStatus::NotStarted => {
                             // Lock the reader for single-chunk upload
                             let reader_guard = reader_arc.lock().await;
-                            let stream_reader = StreamReader::new(
-                                tokio_util::io::ReaderStream::new(reader_guard.clone()),
-                            );
+                            let stream_reader = StreamReader::new(&mut *reader_guard);
 
-                            let body = Body::wrap_stream(stream_reader);
+                            let body = Body::wrap_stream(ReaderStream::new(stream_reader));
 
                             // Single chunk upload for small files
                             resumable_client
@@ -332,11 +330,10 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                let reader_guard = reader_arc.lock().await;
-                                let stream_reader = StreamReader::new(
-                                    tokio_util::io::ReaderStream::new(reader_guard.clone()),
-                                );
-                                let body = Body::wrap_stream(stream_reader);
+                                let mut reader_guard = reader_arc.lock().await;
+                                let stream_reader = StreamReader::new(&mut *reader_guard);
+
+                                let body = Body::wrap_stream(ReaderStream::new(stream_reader));
 
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
