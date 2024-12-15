@@ -370,16 +370,19 @@ impl StoreDriver for GCSStore {
             .retry(unfold(reader, |reader| async move {
                 let retry_result = retry_upload(Arc::clone(&reader)).await.map_or_else(
                     |e| {
-                        // Attempt to reset the reader
-                        let mut reader = reader.lock().await;
-                        if let Err(reset_err) = reader.try_reset_stream() {
-                            RetryResult::Err(make_err!(
-                                Code::Unavailable,
-                                "Failed to reset stream for retry: {reset_err:?} {e:?}"
-                            ))
-                        } else {
-                            RetryResult::Retry(e)
+                        async {
+                            // Attempt to reset the reader
+                            let mut reader = reader.lock().await;
+                            if let Err(reset_err) = reader.try_reset_stream() {
+                                RetryResult::Err(make_err!(
+                                    Code::Unavailable,
+                                    "Failed to reset stream for retry: {reset_err:?} {e:?}"
+                                ))
+                            } else {
+                                RetryResult::Retry(e)
+                            }
                         }
+                        .await
                     },
                     |_| RetryResult::Ok(()),
                 );
