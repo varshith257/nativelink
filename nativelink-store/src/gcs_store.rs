@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::stream;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use google_cloud_storage::client::{Client, ClientConfig};
@@ -40,6 +41,14 @@ const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024;
 
 const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Creates a request for initiating a resumable upload session.
+///
+/// This custom method mirrors `build_resumable_session_simple` from the
+/// `google-cloud-storage` crate, which is currently inaccessible as it is
+/// marked `pub(crate)`. If made public, this can be replaced.
+///
+/// See: https://github.com/yoshidan/google-cloud-rust/issues/328
+///
 #[derive(MetricsComponent)]
 pub struct GCSStore {
     #[metric(help = "The bucket name used for GCSStore")]
@@ -77,8 +86,9 @@ impl GCSStore {
                 let backoff_with_jitter = duration.mul_f32(1.0 + jitter);
                 Box::pin(tokio::time::sleep(backoff_with_jitter))
             }),
-            Arc::new(|delay| {
+            Arc::new(move |delay| {
                 // Exponential backoff: Multiply delay by 2, with an upper cap
+                let retry_delay = retry_delay;
                 let exponential_backoff = delay.mul_f32(2.0);
                 Duration::from_secs_f32(retry_delay).min(exponential_backoff)
             }),
@@ -95,52 +105,9 @@ impl GCSStore {
             downloaded_bytes: 0,
         }))
     }
-
     fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
         format!("{}{}", self.key_prefix, key.as_str())
     }
-
-    /// Creates a request for initiating a resumable upload session.
-    ///
-    /// This custom method mirrors `build_resumable_session_simple` from the
-    /// `google-cloud-storage` crate, which is currently inaccessible as it is
-    /// marked `pub(crate)`. If made public, this can be replaced.
-    ///
-    /// See: https://github.com/yoshidan/google-cloud-rust/issues/328
-    todo!();
-    //     fn build_resumable_session_simple(
-    //         base_url: &str,
-    //         client: &Client,
-    //         req: &UploadObjectRequest,
-    //         media: &Media,
-    //     ) -> RequestBuilder {
-    //         let url = format!(
-    //             "{}/b/{}/o?uploadType=resumable",
-    //             base_url,
-    //             req.bucket.escape(),
-    //         );
-    //         let mut builder = GCSClient
-    //             .post(url)
-    //             .query(&req)
-    //             .query(&[("name", &media.name)])
-    //             .header(CONTENT_LENGTH, 0)
-    //             .header("X-Upload-Content-Type", media.content_type.to_string());
-
-    //         if let Some(len) = media.content_length {
-    //             builder = builder.header("X-Upload-Content-Length", len)
-    //         }
-    //         if let Some(encryption) = &req.encryption {
-    //             builder = builder
-    //                 .header("x-goog-encryption-algorithm", encryption.algorithm.clone())
-    //                 .header("x-goog-encryption-key", encryption.key.clone())
-    //                 .header(
-    //                     "x-goog-encryption-key-sha256",
-    //                     encryption.key_sha256.clone(),
-    //                 );
-    //         }
-
-    //         builder
-    //     }
 }
 
 #[async_trait]
@@ -212,7 +179,7 @@ impl StoreDriver for GCSStore {
     /// For best practices, ensure that session URLs are stored if uploads may need to resume later.
     /// Reference: https://cloud.google.com/storage/docs/resumable-uploads
     async fn update(
-        self: Arc<Self>,
+        self: Pin<&Self>,
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
@@ -314,7 +281,7 @@ impl StoreDriver for GCSStore {
     }
 
     async fn get_part(
-        self: Arc<Self>,
+        self: Pin<&Self>,
         key: StoreKey<'_>,
         writer: &mut DropCloserWriteHalf,
         offset: u64,
