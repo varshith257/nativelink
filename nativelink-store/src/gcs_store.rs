@@ -291,16 +291,28 @@ impl StoreDriver for GCSStore {
 
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
-        let mut chunk_buffer: VecDeque<bytes::Bytes> = VecDeque::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, Error>>(10);
 
         // Spawn a task to read data and send it to the channel
         tokio::spawn(async move {
-            let mut buffer_size = 64 * 1024;
-            while let Ok(bytes) = reader.consume(Some(buffer_size)).await {
-                if bytes.is_empty() {
-                    break;
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                match reader.consume(Some(buffer.len())).await {
+                    Ok(bytes) => {
+                        if bytes.is_empty() {
+                            break;
+                        }
+                        if tx.send(Ok(bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
+                            .await;
+                        break;
+                    }
                 }
-                chunk_buffer.push_back(bytes.into());
             }
         });
 
@@ -309,7 +321,7 @@ impl StoreDriver for GCSStore {
                 let result = async {
                     match resumable_client.status(None).await? {
                         UploadStatus::NotStarted => {
-                            let body = Body::wrap_stream(stream::iter(chunk_buffer.clone()));
+                            let body = Body::wrap_stream(ReceiverStream::new(rx));
 
                             // Single chun upload for small files
                             resumable_client
@@ -340,7 +352,35 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                let body = Body::wrap_stream(stream::iter(chunk_buffer.clone()));
+                                // Re-create the receiver for retries
+                                let (tx, mut rx) =
+                                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, Error>>(10);
+                                tokio::spawn(async move {
+                                    let mut buffer = vec![0u8; 64 * 1024];
+                                    loop {
+                                        match reader.consume(Some(buffer.len())).await {
+                                            Ok(bytes) => {
+                                                if bytes.is_empty() {
+                                                    break;
+                                                }
+                                                if tx.send(Ok(bytes.into())).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx
+                                                    .send(Err(make_err!(
+                                                        Code::Unavailable,
+                                                        "Read error: {e:?}"
+                                                    )))
+                                                    .await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                let body = Body::wrap_stream(ReceiverStream::new(rx));
 
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
