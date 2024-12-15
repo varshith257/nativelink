@@ -290,7 +290,7 @@ impl StoreDriver for GCSStore {
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
         let shared_reader = Arc::new(Mutex::new(reader));
-        
+
         let (mut stream_writer, stream_reader) = tokio::io::duplex(1024 * 64);
 
         self.retrier
@@ -330,7 +330,7 @@ impl StoreDriver for GCSStore {
                                 );
 
                                 let body =
-                                    Body::wrap_stream(ReaderStream::new(stream_reader.clone()));
+                                    Body::wrap_stream(ReaderStream::new(stream_reader));
 
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
