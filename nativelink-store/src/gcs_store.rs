@@ -19,20 +19,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream;
-use futures::stream::unfold;
-use futures::stream::FuturesUnordered;
-use futures::stream::Stream;
-use futures::stream::TryStreamExt;
-use futures::Future;
-use futures::StreamExt;
+use futures::stream::{unfold, FuturesUnordered, Stream};
+use futures::{stream, Future, StreamExt};
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
 use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest};
-use google_cloud_storage::http::resumable_upload_client::ChunkSize;
-use google_cloud_storage::http::resumable_upload_client::ResumableUploadClient;
-use google_cloud_storage::http::resumable_upload_client::UploadStatus;
+use google_cloud_storage::http::resumable_upload_client::{
+    ChunkSize, ResumableUploadClient, UploadStatus,
+};
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error};
 use nativelink_metric::MetricsComponent;
@@ -47,8 +42,7 @@ use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
-use tokio::sync::{mpsc, Mutex, MutexGuard};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::Mutex;
 use tracing::debug;
 
 // Minimum size for GCS multipart uploads.
@@ -62,9 +56,28 @@ const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
-/// A wrapper around `tokio::sync::broadcast::Receiver` that implements the `Stream` trait.  
-/// Converts a broadcast receiver into an asynchronous stream for seamless integration with streaming APIs.  
-/// Ideal for scenarios like chunked data uploads or broadcasting to multiple consumers.  
+// Buffer size for reading chunks of data in bytes.
+// Note: If you change this, adjust the docs in the config.
+const CHUNK_BUFFER_SIZE: usize = 64 * 1024;
+
+/// A wrapper around `tokio::sync::broadcast::Receiver` that implements the `Stream` trait.
+///
+/// # Purpose
+/// `BroadcastStream` bridges the gap between `tokio::sync::broadcast` and the `Stream` trait,
+/// enabling seamless integration of broadcast channels with streaming-based APIs.
+///
+/// # Use Case in GCSStore
+/// In the context of `GCSStore`, this wrapper allows chunked file uploads to be efficiently
+/// streamed to Google Cloud Storage (GCS). Each chunk of data is broadcasted to all subscribers
+/// (e.g., for retry logic or parallel consumers). The `Stream` implementation makes it compatible
+/// with APIs like `Body::wrap_stream` which simplifies the upload process.
+///
+/// # Benefits
+/// - Converts the push-based `broadcast::Receiver` into a pull-based `Stream`, enabling compatibility
+///   with `Stream`-based APIs.
+/// - Handles error cases gracefully, converting `RecvError::Closed` to `None` to signal stream completion.
+/// - Allows multiple consumers to read from the same broadcasted data stream, useful for parallel processing.
+///
 struct BroadcastStream<T> {
     receiver: Receiver<T>,
 }
@@ -213,7 +226,7 @@ impl GCSStore {
                 .map_err(|_| make_err!(Code::Unavailable, "Invalid session URL"))?
                 .to_string();
 
-            let reqwest_client = ReqwestClient::builder()
+            let _reqwest_client = ReqwestClient::builder()
                 .build()
                 .expect("Failed to create reqwest client");
 
@@ -331,7 +344,7 @@ impl StoreDriver for GCSStore {
             let reader_clone = Arc::clone(&reader);
             let tx = tx.clone();
             tokio::spawn(async move {
-                let buffer = vec![0u8; 64 * 1024];
+                let buffer = vec![0u8; CHUNK_BUFFER_SIZE];
                 let mut reader = reader_clone.lock().await;
 
                 loop {
@@ -359,7 +372,7 @@ impl StoreDriver for GCSStore {
             object_name: Arc<String>,
             file_size: usize,
         ) -> Result<(), Error> {
-            let mut rx = tx.subscribe();
+            let rx = tx.subscribe();
 
             let body = Body::wrap_stream(BroadcastStream::new(rx).map(|res| {
                 res.map_err(|e| {
@@ -394,7 +407,7 @@ impl StoreDriver for GCSStore {
                             chunk_size, object_name
                         );
 
-                        let mut rx = tx.subscribe();
+                        let rx = tx.subscribe();
 
                         let chunk_body = Body::wrap_stream(BroadcastStream::new(rx).map(|res| {
                             res.map_err(|e| {
