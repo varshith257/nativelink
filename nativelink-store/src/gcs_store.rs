@@ -41,8 +41,8 @@ use rand::random;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
-use tokio::io::DuplexStream;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
+use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
@@ -289,13 +289,10 @@ impl StoreDriver for GCSStore {
 
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
-        let (stream_writer, stream_reader) = DuplexStream::pair();
-        tokio::spawn(async move {
-            let mut stream_writer = stream_writer;
-            tokio::io::copy(&mut reader, &mut stream_writer)
-                .await
-                .expect("Failed to write to duplex stream");
-        });
+        let shared_reader = Arc::new(Mutex::new(reader));
+        
+        let (mut stream_writer, stream_reader) = tokio::io::duplex(1024 * 64);
+
         self.retrier
             .retry(stream::once(async {
                 let result = async {
