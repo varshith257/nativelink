@@ -290,96 +290,86 @@ impl StoreDriver for GCSStore {
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
         // Retry logic
+        let retry_upload = |reader: DropCloserReadHalf| async move {
+            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
+
+            // Spawn a task to read data into the channel
+            tokio::spawn({
+                let mut reader = reader.clone();
+                let mut buffer = vec![0u8; 64 * 1024];
+                async move {
+                    loop {
+                        match reader.consume(Some(buffer.len())).await {
+                            Ok(bytes) => {
+                                if bytes.is_empty() {
+                                    break; // EOF
+                                }
+                                if tx.send(Ok(bytes.into())).await.is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let body = Body::wrap_stream(ReceiverStream::new(rx));
+
+            match resumable_client.status(None).await? {
+                UploadStatus::NotStarted => {
+                    resumable_client
+                        .upload_single_chunk(body, file_size)
+                        .await
+                        .map_err(|e| {
+                            make_err!(Code::Unavailable, "Single chunk upload failed: {e:?}")
+                        })?;
+                }
+                UploadStatus::ResumeIncomplete(range) => {
+                    let total_size = file_size as u64;
+                    let mut current_position = range.last_byte + 1;
+
+                    while current_position < total_size {
+                        let chunk_size = ChunkSize::new(
+                            current_position,
+                            (current_position + DEFAULT_CHUNK_SIZE as u64 - 1).min(total_size - 1),
+                            Some(total_size),
+                        );
+
+                        debug!(
+                            "Uploading chunk: {:?} for object: {}",
+                            chunk_size, object_name
+                        );
+
+                        let chunk_body = Body::wrap_stream(ReceiverStream::new(rx));
+
+                        resumable_client
+                            .upload_multiple_chunk(chunk_body, &chunk_size)
+                            .await
+                            .map_err(|e| {
+                                make_err!(Code::Unavailable, "Chunk upload failed: {e:?}")
+                            })?;
+
+                        current_position += chunk_size.size();
+                    }
+                }
+                UploadStatus::Ok(_) => {
+                    debug!("Upload completed!");
+                }
+            }
+            Ok::<(), Error>(())
+        };
+
         self.retrier
             .retry(unfold(reader, move |mut reader| async move {
-                let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
-
-                // Spawn a task to read data into the channel
-                tokio::spawn({
-                    let mut buffer = vec![0u8; 64 * 1024];
-                    async move {
-                        loop {
-                            match reader.consume(Some(buffer.len())).await {
-                                Ok(bytes) => {
-                                    if bytes.is_empty() {
-                                        break; // EOF
-                                    }
-                                    if tx.send(Ok(bytes.into())).await.is_err() {
-                                        break; // Receiver dropped
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(make_err!(
-                                            Code::Unavailable,
-                                            "Read error: {e:?}"
-                                        )))
-                                        .await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-
-                let body = Body::wrap_stream(ReceiverStream::new(rx));
-
-                let retry_result = async {
-                    match resumable_client.status(None).await? {
-                        UploadStatus::NotStarted => {
-                            resumable_client
-                                .upload_single_chunk(body, file_size)
-                                .await
-                                .map_err(|e| {
-                                    make_err!(
-                                        Code::Unavailable,
-                                        "Single chunk upload failed: {e:?}"
-                                    )
-                                })?;
-                        }
-                        UploadStatus::ResumeIncomplete(range) => {
-                            let total_size = file_size as u64;
-                            let mut current_position = range.last_byte + 1;
-
-                            while current_position < total_size {
-                                let chunk_size = ChunkSize::new(
-                                    current_position,
-                                    (current_position + DEFAULT_CHUNK_SIZE as u64 - 1)
-                                        .min(total_size - 1),
-                                    Some(total_size),
-                                );
-
-                                debug!(
-                                    "Uploading chunk: {:?} for object: {}",
-                                    chunk_size, object_name
-                                );
-
-                                let chunk_body = Body::wrap_stream(ReceiverStream::new(rx));
-
-                                resumable_client
-                                    .upload_multiple_chunk(chunk_body, &chunk_size)
-                                    .await
-                                    .map_err(|e| {
-                                        make_err!(Code::Unavailable, "Chunk upload failed: {e:?}")
-                                    })?;
-
-                                current_position += chunk_size.size();
-                            }
-                        }
-                        UploadStatus::Ok(_) => {
-                            debug!("Upload completed!");
-                            return Ok(());
-                        }
-                    }
-
-                    Ok::<(), Error>(())
-                }
-                .await;
-
-                match retry_result {
-                    Ok(_) => RetryResult::Ok(()),
-                    Err(e) => {
-                        // Reset reader for retry
+                let retry_result = retry_upload(reader.clone()).await.map_or_else(
+                    |e| {
+                        // Attempt to reset the reader
                         if let Err(reset_err) = reader.try_reset_stream() {
                             RetryResult::Err(make_err!(
                                 Code::Unavailable,
@@ -388,14 +378,18 @@ impl StoreDriver for GCSStore {
                         } else {
                             RetryResult::Retry(e)
                         }
-                    }
-                }
+                    },
+                    |_| RetryResult::Ok(()),
+                );
+
+                Some((retry_result, reader))
             }))
             .await?;
 
         debug!("Upload completed for object: {}", object_name);
         Ok(())
     }
+
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
