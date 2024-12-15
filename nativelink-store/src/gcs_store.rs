@@ -43,6 +43,7 @@ use reqwest::Body;
 use reqwest::Client as ReqwestClient;
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
 use tokio_util::io::{ReaderStream, StreamReader};
+use tokio::sync::Mutex; 
 use tracing::debug;
 
 // Minimum size for GCS multipart uploads.
