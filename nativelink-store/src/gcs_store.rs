@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,10 +41,8 @@ use rand::random;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
 // Minimum size for GCS multipart uploads.
@@ -291,21 +288,20 @@ impl StoreDriver for GCSStore {
 
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
-        let (tx, _) = broadcast::channel::<Result<bytes::Bytes, Error>>(10);
+        let retry_upload = |mut reader: DropCloserReadHalf| async move {
+            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
 
-        // Spawn a task to read data and send it to the channel
-        tokio::spawn({
-            let tx = tx.clone();
-            async move {
+            // Spawn a task to read data and send it to the channel
+            tokio::spawn(async move {
                 let mut buffer = vec![0u8; 64 * 1024];
                 loop {
                     match reader.consume(Some(buffer.len())).await {
                         Ok(bytes) => {
                             if bytes.is_empty() {
-                                break;
+                                break; // EOF
                             }
-                            if tx.send(Ok(bytes.into())).is_err() {
-                                break;
+                            if tx.send(Ok(bytes.into())).await.is_err() {
+                                break; // Receiver dropped
                             }
                         }
                         Err(e) => {
@@ -316,82 +312,109 @@ impl StoreDriver for GCSStore {
                         }
                     }
                 }
-            }
-        });
+            });
 
-        self.retrier
-            .retry(stream::once(async {
-                let result = async {
-                    match resumable_client.status(None).await? {
-                        UploadStatus::NotStarted => {
-                            let mut rx = tx.subscribe();
-                            let body = Body::wrap_stream(ReceiverStream::new(rx));
-                            // Single chun upload for small files
-                            resumable_client
-                                .upload_single_chunk(body, file_size as usize)
-                                .await
-                                .map_err(|e| {
-                                    make_err!(
-                                        Code::Unavailable,
-                                        "Single chunk upload failed: {e:?}"
-                                    )
-                                })?;
-                        }
-                        UploadStatus::ResumeIncomplete(range) => {
-                            // Resumable chunked upload for large files
-                            let total_size = file_size as u64;
-                            let mut current_position = range.last_byte + 1;
+            let body = Body::wrap_stream(ReceiverStream::new(rx));
 
-                            while current_position < total_size {
-                                let chunk_size = ChunkSize::new(
-                                    current_position,
-                                    (current_position + DEFAULT_CHUNK_SIZE as u64 - 1)
-                                        .min(total_size - 1),
-                                    Some(total_size),
-                                );
+            match resumable_client.status(None).await? {
+                UploadStatus::NotStarted => {
+                    resumable_client
+                        .upload_single_chunk(body, file_size)
+                        .await
+                        .map_err(|e| {
+                            make_err!(Code::Unavailable, "Single chunk upload failed: {e:?}")
+                        })?;
+                }
+                UploadStatus::ResumeIncomplete(range) => {
+                    let total_size = file_size as u64;
+                    let mut current_position = range.last_byte + 1;
 
-                                debug!(
-                                    "Uploading chunk: {:?} for object: {}",
-                                    chunk_size, object_name
-                                );
+                    while current_position < total_size {
+                        let chunk_size = ChunkSize::new(
+                            current_position,
+                            (current_position + DEFAULT_CHUNK_SIZE as u64 - 1).min(total_size - 1),
+                            Some(total_size),
+                        );
 
-                                // Subscribe to the same broadcast channel for retries
-                                let mut rx = tx.subscribe();
-                                let body = Body::wrap_stream(ReceiverStream::new(rx));
+                        debug!(
+                            "Uploading chunk: {:?} for object: {}",
+                            chunk_size, object_name
+                        );
 
-                                resumable_client
-                                    .upload_multiple_chunk(body, &chunk_size)
-                                    .await
-                                    .map_err(|e| {
-                                        make_err!(Code::Unavailable, "Chunk upload failed: {e:?}")
-                                    })?;
+                        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
 
-                                current_position += chunk_size.size();
+                        // Recreate the reading stream
+                        tokio::spawn(async move {
+                            let mut buffer = vec![0u8; 64 * 1024];
+                            loop {
+                                match reader.consume(Some(buffer.len())).await {
+                                    Ok(bytes) => {
+                                        if bytes.is_empty() {
+                                            break; // EOF
+                                        }
+                                        if tx.send(Ok(bytes.into())).await.is_err() {
+                                            break; // Receiver dropped
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(make_err!(
+                                                Code::Unavailable,
+                                                "Read error: {e:?}"
+                                            )))
+                                            .await;
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        UploadStatus::Ok(_) => {
-                            debug!("Upload completed!");
-                            return Ok(());
-                        }
-                    }
-                    Ok::<(), Error>(())
-                }
-                .await;
+                        });
 
-                match result {
-                    Ok(_) => RetryResult::Ok(()),
-                    Err(e) => {
-                        debug!("Retryable upload error: {:?}", e);
-                        RetryResult::Retry(e)
+                        let chunk_body = Body::wrap_stream(ReceiverStream::new(rx));
+
+                        resumable_client
+                            .upload_multiple_chunk(chunk_body, &chunk_size)
+                            .await
+                            .map_err(|e| {
+                                make_err!(Code::Unavailable, "Chunk upload failed: {e:?}")
+                            })?;
+
+                        current_position += chunk_size.size();
                     }
                 }
+                UploadStatus::Ok(_) => {
+                    debug!("Upload completed!");
+                }
+            }
+
+            Ok::<(), Error>(())
+        };
+
+        // Retry logic with reader reset
+        self.retrier
+            .retry(unfold(reader, |mut reader| async {
+                let retry_result = retry_upload(reader).await.map_or_else(
+                    |e| {
+                        // Reset reader for retry
+                        reader
+                            .try_reset_stream()
+                            .map_err(|reset_err| {
+                                make_err!(Code::Unavailable, "{e:?} {reset_err:?}")
+                            })
+                            .map_or_else(
+                                |reset_err| RetryResult::Err(reset_err),
+                                |_| RetryResult::Retry(e),
+                            )
+                    },
+                    |_| RetryResult::Ok(()),
+                );
+
+                Some((retry_result, reader))
             }))
             .await?;
 
         debug!("Upload completed for object: {}", object_name);
         Ok(())
     }
-
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
