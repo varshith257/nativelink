@@ -2250,6 +2250,7 @@ name = "nativelink-error"
 version = "0.5.3"
 dependencies = [
  "fred",
+ "google-cloud-storage",
  "hex",
  "nativelink-metric",
  "nativelink-proto",
@@ -2428,6 +2429,7 @@ dependencies = [
  "prost",
  "rand",
  "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "serial_test",
