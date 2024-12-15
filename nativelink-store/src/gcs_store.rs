@@ -43,7 +43,7 @@ use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::sync::{mpsc, Mutex, MutexGuard};
-use tokio_stream::wrappers::ReceiverStream
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
@@ -292,25 +292,35 @@ impl StoreDriver for GCSStore {
 
         let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
 
-            // Spawn a task to read data and send it to the channel
-    tokio::spawn(async move {
-        let mut buffer = vec![0u8; 64 * 1024]; // 64 KB buffer
-        while let Ok(bytes_read) = reader.read(&mut buffer).await {
-            if bytes_read == 0 {
-                break; // EOF
+        // Spawn a task to read data and send it to the channel
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                match reader.consume(Some(buffer_size)).await {
+                    Ok(bytes) => {
+                        if bytes.is_empty() {
+                            break;
+                        }
+                        if tx.send(Ok(bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
+                            .await;
+                        break;
+                    }
+                }
             }
-            if tx.send(Ok(bytes::Bytes::copy_from_slice(&buffer[..bytes_read]))).await.is_err() {
-                break; // Receiver dropped
-            }
-        }
-    });
+        });
 
         self.retrier
             .retry(stream::once(async {
                 let result = async {
                     match resumable_client.status(None).await? {
                         UploadStatus::NotStarted => {
-                                                   let body = Body::wrap_stream(ReceiverStream::new(rx));
+                            let body = Body::wrap_stream(ReceiverStream::new(rx));
 
                             // Single chun upload for small files
                             resumable_client
@@ -341,7 +351,7 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                                           let body = Body::wrap_stream(ReceiverStream::new(rx));
+                                let body = Body::wrap_stream(ReceiverStream::new(rx));
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
                                     .await
