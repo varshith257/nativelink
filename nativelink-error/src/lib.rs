@@ -224,7 +224,11 @@ impl From<GcsError> for Error {
     fn from(err: GcsError) -> Self {
         match err {
             GcsError::Response(error_response) => {
-                make_err!(Code::Unavailable, "GCS Response Error: {:?}", error_response)
+                make_err!(
+                    Code::Unavailable,
+                    "GCS Response Error: {:?}",
+                    error_response
+                )
             }
             GcsError::HttpClient(error) => {
                 make_err!(Code::Unavailable, "GCS HTTP Client Error: {:?}", error)
@@ -236,7 +240,11 @@ impl From<GcsError> for Error {
                 make_err!(Code::Unauthenticated, "GCS Token Source Error: {:?}", error)
             }
             GcsError::InvalidRangeHeader(header) => {
-                make_err!(Code::InvalidArgument, "GCS Invalid Range Header: {:?}", header)
+                make_err!(
+                    Code::InvalidArgument,
+                    "GCS Invalid Range Header: {:?}",
+                    header
+                )
             }
         }
     }

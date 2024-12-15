@@ -150,7 +150,7 @@ impl GCSStore {
         content_length: Option<u64>,
     ) -> Result<String, Error> {
         let media = Media {
-            name: object_name.to_string(),
+            name: Cow::Owned(object_name.to_string()),
             content_type: "application/octet-stream".into(),
             content_length,
         };
@@ -283,8 +283,10 @@ impl StoreDriver for GCSStore {
             .build()
             .expect("Failed to create reqwest client");
 
-        let client_with_middleware = ClientWithMiddleware::builder(reqwest_client).build();
-
+            let client_with_middleware = ClientWithMiddleware::new(
+                reqwest_client,
+                Vec::<Arc<dyn Middleware>>::new(),
+            );
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
         self.retrier
