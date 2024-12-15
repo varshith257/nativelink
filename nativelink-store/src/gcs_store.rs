@@ -289,31 +289,32 @@ impl StoreDriver for GCSStore {
 
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
+        let reader = Arc::new(Mutex::new(reader));
+
         // Retry logic
-        let retry_upload = |reader: DropCloserReadHalf| async move {
+        let retry_upload = |reader: Arc<Mutex<DropCloserReadHalf>>| async move {
             let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
 
-            // Spawn a task to read data into the channel
-            tokio::spawn({
-                let mut reader = reader.clone();
+            let reader_clone = Arc::clone(&reader);
+            tokio::spawn(async move {
                 let mut buffer = vec![0u8; 64 * 1024];
-                async move {
-                    loop {
-                        match reader.consume(Some(buffer.len())).await {
-                            Ok(bytes) => {
-                                if bytes.is_empty() {
-                                    break; // EOF
-                                }
-                                if tx.send(Ok(bytes.into())).await.is_err() {
-                                    break; // Receiver dropped
-                                }
+                let mut reader = reader_clone.lock().await;
+
+                loop {
+                    match reader.consume(Some(buffer.len())).await {
+                        Ok(bytes) => {
+                            if bytes.is_empty() {
+                                break; // EOF
                             }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
-                                    .await;
-                                break;
+                            if tx.send(Ok(bytes.into())).await.is_err() {
+                                break; // Receiver dropped
                             }
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
+                                .await;
+                            break;
                         }
                     }
                 }
@@ -366,10 +367,11 @@ impl StoreDriver for GCSStore {
         };
 
         self.retrier
-            .retry(unfold(reader, move |mut reader| async move {
-                let retry_result = retry_upload(reader.clone()).await.map_or_else(
+            .retry(unfold(reader, |reader| async move {
+                let retry_result = retry_upload(Arc::clone(&reader)).await.map_or_else(
                     |e| {
                         // Attempt to reset the reader
+                        let mut reader = reader.lock().await;
                         if let Err(reset_err) = reader.try_reset_stream() {
                             RetryResult::Err(make_err!(
                                 Code::Unavailable,
