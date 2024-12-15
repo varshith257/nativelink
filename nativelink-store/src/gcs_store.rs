@@ -29,7 +29,7 @@ use google_cloud_storage::http::resumable_upload_client::ChunkSize;
 use google_cloud_storage::http::resumable_upload_client::ResumableUploadClient;
 use google_cloud_storage::http::resumable_upload_client::UploadStatus;
 use nativelink_config::stores::GCSSpec;
-use nativelink_error::{make_err, Code, Error};
+use nativelink_error::{make_err, Code, Error, GcsError};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
@@ -37,6 +37,7 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::random;
+use reqwest::Body;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest_middleware::{ClientWithMiddleware as Client, RequestBuilder};
 use tracing::debug;
@@ -250,7 +251,6 @@ impl StoreDriver for GCSStore {
     /// GCS Resumable Uploads Note:
     /// Resumable upload sessions in GCS do not require explicit abort calls for cleanup.
     /// GCS automatically deletes incomplete sessions after a configurable period (default: 1 week).
-    /// For best practices, ensure that session URLs are stored if uploads may need to resume later.
     /// Reference: https://cloud.google.com/storage/docs/resumable-uploads
     async fn update(
         self: Pin<&Self>,
@@ -282,13 +282,13 @@ impl StoreDriver for GCSStore {
                         UploadStatus::NotStarted => {
                             // Single chunk upload for small files
                             resumable_client
-                                .upload_single_chunk(reader.clone(), file_size as usize)
+                                .upload_single_chunk(reader, file_size as usize)
                                 .await?;
                         }
                         UploadStatus::ResumeIncomplete(range) => {
                             // Resumable chunked upload for large files
                             let total_size = range.total_size.unwrap_or(file_size);
-                            let mut current_position = range.last_uploaded_byte.unwrap_or(0);
+                            let mut current_position = range.last_byte + 1;
 
                             while current_position < total_size {
                                 let chunk_size = ChunkSize::new(
@@ -298,13 +298,15 @@ impl StoreDriver for GCSStore {
                                 );
 
                                 debug!(
-                                    "Uploading chunk: {}-{} for object: {}",
-                                    chunk_size.first_byte, chunk_size.last_byte, object_name
+                                    "Uploading chunk: {:?} for object: {}",
+                                    chunk_size, object_name
                                 );
+                                let body = Body::wrap_stream(reader);
 
                                 resumable_client
-                                    .upload_multiple_chunk(&mut reader, &chunk_size)
-                                    .await?;
+                                .upload_multiple_chunk(body, &chunk_size)
+                                .await
+                                .map_err(|e| make_err!(Code::Unavailable, "Chunk upload failed: {e:?}"))?;
 
                                 current_position += chunk_size.size();
                             }
