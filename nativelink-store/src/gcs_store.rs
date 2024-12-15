@@ -266,7 +266,7 @@ impl StoreDriver for GCSStore {
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
-        let object_name = self.make_gcs_path(&key);
+        let object_name = Arc::new(self.make_gcs_path(&key));
 
         let file_size = match upload_size {
             UploadSizeInfo::ExactSize(size) => size,
@@ -291,11 +291,12 @@ impl StoreDriver for GCSStore {
 
         let reader = Arc::new(Mutex::new(reader));
 
-        // Retry logic
-        let retry_upload = |reader: Arc<Mutex<DropCloserReadHalf>>| async move {
-            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
+        let (tx, _) = tokio::sync::broadcast::channel::<Result<bytes::Bytes, Error>>(10);
 
+        // Spawn a task to read data and broadcast it
+        {
             let reader_clone = Arc::clone(&reader);
+            let tx = tx.clone();
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 64 * 1024];
                 let mut reader = reader_clone.lock().await;
@@ -306,19 +307,26 @@ impl StoreDriver for GCSStore {
                             if bytes.is_empty() {
                                 break; // EOF
                             }
-                            if tx.send(Ok(bytes.into())).await.is_err() {
-                                break; // Receiver dropped
+                            if tx.send(Ok(bytes.into())).is_err() {
+                                break; // No active receivers
                             }
                         }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
-                                .await;
+                            let _ = tx.send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")));
                             break;
                         }
                     }
                 }
             });
+        }
+
+        async fn retry_upload(
+            tx: &tokio::sync::broadcast::Sender<Result<bytes::Bytes, Error>>,
+            resumable_client: &ResumableUploadClient,
+            object_name: Arc<String>,
+            file_size: usize,
+        ) -> Result<(), Error> {
+            let mut rx = tx.subscribe();
 
             let body = Body::wrap_stream(ReceiverStream::new(rx));
 
@@ -347,6 +355,7 @@ impl StoreDriver for GCSStore {
                             chunk_size, object_name
                         );
 
+                        let mut rx = tx.subscribe();
                         let chunk_body = Body::wrap_stream(ReceiverStream::new(rx));
 
                         resumable_client
@@ -364,25 +373,27 @@ impl StoreDriver for GCSStore {
                 }
             }
             Ok::<(), Error>(())
-        };
+        }
 
         self.retrier
-            .retry(unfold(reader, |reader| async move {
-                let retry_result = retry_upload(Arc::clone(&reader)).await.map_or_else(
-                    |e: Error| {
-                        // Attempt to reset the reader
-                        let mut reader = futures::executor::block_on(reader.lock());
-                        if let Err(reset_err) = reader.try_reset_stream() {
-                            RetryResult::Err(make_err!(
-                                Code::Unavailable,
-                                "Failed to reset stream for retry: {reset_err:?} {e:?}"
-                            ))
-                        } else {
-                            RetryResult::Retry(e)
+            .retry(unfold(tx, |tx| async move {
+                let retry_result =
+                    match retry_upload(&tx, &resumable_client, Arc::clone(&object_name), file_size)
+                        .await
+                    {
+                        Ok(_) => RetryResult::Ok(()),
+                        Err(e) => {
+                            let mut reader = reader.lock().await;
+                            if let Err(reset_err) = reader.try_reset_stream() {
+                                RetryResult::Err(make_err!(
+                                    Code::Unavailable,
+                                    "Failed to reset stream for retry: {reset_err:?} {e:?}"
+                                ))
+                            } else {
+                                RetryResult::Retry(e)
+                            }
                         }
-                    },
-                    |_| RetryResult::Ok(()),
-                );
+                    };
 
                 Some((retry_result, reader))
             }))
