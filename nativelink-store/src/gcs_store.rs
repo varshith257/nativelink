@@ -294,7 +294,7 @@ impl StoreDriver for GCSStore {
 
         // Spawn a task to read data and send it to the channel
         tokio::spawn(async move {
-            let mut buffer_size = vec![0u8; 64 * 1024];
+            let mut buffer_size = 64 * 1024;
             loop {
                 match reader.consume(Some(buffer_size)).await {
                     Ok(bytes) => {
