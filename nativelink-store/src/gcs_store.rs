@@ -351,7 +351,8 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                let body = Body::wrap_stream(ReceiverStream::new(rx));
+                                let body = Body::wrap_stream(ReceiverStream::new(rx.clone()));
+
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
                                     .await
