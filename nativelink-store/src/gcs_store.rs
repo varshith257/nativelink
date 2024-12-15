@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -290,28 +291,16 @@ impl StoreDriver for GCSStore {
 
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
-        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, Error>>(10);
+        let mut chunk_buffer: VecDeque<bytes::Bytes> = VecDeque::new();
 
         // Spawn a task to read data and send it to the channel
         tokio::spawn(async move {
             let mut buffer_size = 64 * 1024;
-            loop {
-                match reader.consume(Some(buffer_size)).await {
-                    Ok(bytes) => {
-                        if bytes.is_empty() {
-                            break;
-                        }
-                        if tx.send(Ok(bytes.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")))
-                            .await;
-                        break;
-                    }
+            while let Ok(bytes) = reader.consume(Some(buffer_size)).await {
+                if bytes.is_empty() {
+                    break;
                 }
+                chunk_buffer.push_back(bytes.into());
             }
         });
 
@@ -320,7 +309,7 @@ impl StoreDriver for GCSStore {
                 let result = async {
                     match resumable_client.status(None).await? {
                         UploadStatus::NotStarted => {
-                            let body = Body::wrap_stream(ReceiverStream::new(rx));
+                            let body = Body::wrap_stream(stream::iter(chunk_buffer.clone()));
 
                             // Single chun upload for small files
                             resumable_client
@@ -351,7 +340,7 @@ impl StoreDriver for GCSStore {
                                     chunk_size, object_name
                                 );
 
-                                let body = Body::wrap_stream(ReceiverStream::new(rx.clone()));
+                                let body = Body::wrap_stream(stream::iter(chunk_buffer.clone()));
 
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
