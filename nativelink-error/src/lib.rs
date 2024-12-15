@@ -14,7 +14,7 @@
 
 use std::convert::Into;
 
-use google_cloud_storage::http::Error as GcsError;
+pub use google_cloud_storage::http::Error as GcsError;
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
 };
