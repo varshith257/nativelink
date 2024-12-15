@@ -37,7 +37,8 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::random;
-use reqwest::header::{HeaderValue, LOCATION};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest_middleware::{ClientWithMiddleware as Client, RequestBuilder};
 use tracing::debug;
 
 // Minimum size for GCS multipart uploads.
@@ -111,6 +112,32 @@ impl GCSStore {
         format!("{}{}", self.key_prefix, key.as_str())
     }
 
+    fn build_resumable_session_simple(
+        &self,
+        base_url: &str,
+        client: &Client,
+        req: &UploadObjectRequest,
+        media: &Media,
+    ) -> RequestBuilder {
+        let url = format!(
+            "{}/b/{}/o?uploadType=resumable",
+            base_url,
+            utf8_percent_encode(&req.bucket, NON_ALPHANUMERIC)
+        );
+        let mut builder = client
+            .post(url)
+            .query(req)
+            .query(&[("name", &media.name)])
+            .header(CONTENT_TYPE, media.content_type.to_string())
+            .header(CONTENT_LENGTH, "0");
+
+        if let Some(content_length) = media.content_length {
+            builder = builder.header("X-Upload-Content-Length", content_length.to_string());
+        }
+
+        builder
+    }
+
     pub async fn start_resumable_upload(
         &self,
         bucket: &str,
@@ -123,9 +150,9 @@ impl GCSStore {
             content_length,
         };
 
-        let request = build_resumable_session_simple(
+        let request = self.build_resumable_session_simple(
             "https://storage.googleapis.com",
-            client,
+            &self.gcs_client,
             &UploadObjectRequest {
                 bucket: bucket.to_string(),
                 ..Default::default()
@@ -144,7 +171,10 @@ impl GCSStore {
                 .map_err(|_| make_err!(Code::Unavailable, "Invalid session URL"))?
                 .to_string();
 
-            Ok(ResumableUploadClient::new(session_url, client.clone()))
+            Ok(ResumableUploadClient::new(
+                session_url,
+                self.gcs_client.clone(),
+            ))
         } else {
             Err(make_err!(
                 Code::Unavailable,
