@@ -24,6 +24,7 @@ use futures::stream::unfold;
 use futures::stream::FuturesUnordered;
 use futures::stream::Stream;
 use futures::stream::TryStreamExt;
+use futures::Future;
 use futures::StreamExt;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
@@ -365,7 +366,7 @@ impl StoreDriver for GCSStore {
                     debug!("Stream error: {:?}", e);
                     std::io::Error::new(std::io::ErrorKind::Other, "Stream failed")
                 })
-                .unwrap_or_else(|_| bytes::Bytes::new())
+                .unwrap_or_else(|_| Ok(bytes::Bytes::new()))
             }));
 
             match resumable_client.status(None).await? {
@@ -394,7 +395,14 @@ impl StoreDriver for GCSStore {
                         );
 
                         let mut rx = tx.subscribe();
-                        let chunk_body = Body::wrap_stream(BroadcastStream::new(rx));
+
+                        let chunk_body = Body::wrap_stream(BroadcastStream::new(rx).map(|res| {
+                            res.map_err(|e| {
+                                debug!("Stream error: {:?}", e);
+                                std::io::Error::new(std::io::ErrorKind::Other, "Stream failed")
+                            })
+                            .unwrap_or_else(|_| Ok(bytes::Bytes::new()))
+                        }));
 
                         resumable_client
                             .upload_multiple_chunk(chunk_body, &chunk_size)
@@ -414,35 +422,41 @@ impl StoreDriver for GCSStore {
         }
 
         self.retrier
-            .retry(unfold(tx.clone(), move |tx| {
+            .retry(unfold(tx.clone(), {
                 let resumable_client = resumable_client.clone();
                 let object_name = Arc::clone(&object_name);
                 let reader = Arc::clone(&reader);
 
-                async move {
-                    let retry_result = match retry_upload(
-                        &tx,
-                        &resumable_client,
-                        Arc::clone(&object_name),
-                        file_size,
-                    )
-                    .await
-                    {
-                        Ok(_) => RetryResult::Ok(()),
-                        Err(e) => {
-                            let mut reader = reader.lock().await;
-                            if let Err(reset_err) = reader.try_reset_stream() {
-                                RetryResult::Err(make_err!(
-                                    Code::Unavailable,
-                                    "Failed to reset stream for retry: {reset_err:?} {e:?}"
-                                ))
-                            } else {
-                                RetryResult::Retry(e)
-                            }
-                        }
-                    };
+                move |tx| {
+                    let resumable_client = resumable_client.clone();
+                    let object_name = Arc::clone(&object_name_clone);
+                    let reader = Arc::clone(&reader);
 
-                    Some((retry_result, tx))
+                    async move {
+                        let retry_result = match retry_upload(
+                            &tx,
+                            &resumable_client,
+                            Arc::clone(&object_name),
+                            file_size,
+                        )
+                        .await
+                        {
+                            Ok(_) => RetryResult::Ok(()),
+                            Err(e) => {
+                                let mut reader = reader.lock().await;
+                                if let Err(reset_err) = reader.try_reset_stream() {
+                                    RetryResult::Err(make_err!(
+                                        Code::Unavailable,
+                                        "Failed to reset stream for retry: {reset_err:?} {e:?}"
+                                    ))
+                                } else {
+                                    RetryResult::Retry(e)
+                                }
+                            }
+                        };
+
+                        Some((retry_result, tx))
+                    }
                 }
             }))
             .await?;
