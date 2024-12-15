@@ -283,10 +283,8 @@ impl StoreDriver for GCSStore {
             .build()
             .expect("Failed to create reqwest client");
 
-            let client_with_middleware = ClientWithMiddleware::new(
-                reqwest_client,
-                Vec::<Arc<dyn Middleware>>::new(),
-            );
+        let client_with_middleware =
+            ClientWithMiddleware::new(reqwest_client, Vec::<Arc<dyn Middleware>>::new());
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
         self.retrier
@@ -328,7 +326,11 @@ impl StoreDriver for GCSStore {
                                     "Uploading chunk: {:?} for object: {}",
                                     chunk_size, object_name
                                 );
-                                let body = Body::wrap_stream(reader);
+
+                                let stream_reader = StreamReader::new(reader.map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                                }));
+                                let body = Body::wrap_stream(ReaderStream::new(stream_reader));
 
                                 resumable_client
                                     .upload_multiple_chunk(body, &chunk_size)
