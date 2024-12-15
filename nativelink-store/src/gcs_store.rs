@@ -37,8 +37,8 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::random;
-use reqwest::Body;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest::Body;
 use reqwest_middleware::{ClientWithMiddleware as Client, RequestBuilder};
 use tracing::debug;
 
@@ -304,9 +304,11 @@ impl StoreDriver for GCSStore {
                                 let body = Body::wrap_stream(reader);
 
                                 resumable_client
-                                .upload_multiple_chunk(body, &chunk_size)
-                                .await
-                                .map_err(|e| make_err!(Code::Unavailable, "Chunk upload failed: {e:?}"))?;
+                                    .upload_multiple_chunk(body, &chunk_size)
+                                    .await
+                                    .map_err(|e| {
+                                        make_err!(Code::Unavailable, "Chunk upload failed: {e:?}")
+                                    })?;
 
                                 current_position += chunk_size.size();
                             }
