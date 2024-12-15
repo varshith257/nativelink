@@ -15,12 +15,13 @@
 use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream;
 use futures::stream::unfold;
 use futures::stream::FuturesUnordered;
+use futures::stream::Stream;
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use google_cloud_storage::client::{Client, ClientConfig};
@@ -42,7 +43,8 @@ use rand::random;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::{Body, Client as ReqwestClient};
 use reqwest_middleware::{ClientWithMiddleware, Middleware};
-use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard};
+use tokio::sync::broadcast::{Receiver, RecvError};
+use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
@@ -56,6 +58,32 @@ const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
+/// A wrapper around `tokio::sync::broadcast::Receiver` that implements the `Stream` trait.  
+/// Converts a broadcast receiver into an asynchronous stream for seamless integration with streaming APIs.  
+/// Ideal for scenarios like chunked data uploads or broadcasting to multiple consumers.  
+struct BroadcastStream<T> {
+    receiver: Receiver<T>,
+}
+
+impl<T: Clone> BroadcastStream<T> {
+    fn new(receiver: Receiver<T>) -> Self {
+        BroadcastStream { receiver }
+    }
+}
+
+impl<T: Clone> Stream for BroadcastStream<T> {
+    type Item = Result<T, RecvError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.receiver.recv() {
+            Ok(value) => Poll::Ready(Some(Ok(value))),
+            Err(RecvError::Closed) => Poll::Ready(None),
+            Err(e) => Poll::Ready(Some(Err(e))),
+        }
+    }
+}
 
 #[derive(MetricsComponent)]
 pub struct GCSStore {
@@ -290,7 +318,6 @@ impl StoreDriver for GCSStore {
         let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
 
         let reader = Arc::new(Mutex::new(reader));
-
         let (tx, _) = tokio::sync::broadcast::channel::<Result<bytes::Bytes, Error>>(10);
 
         // Spawn a task to read data and broadcast it
@@ -328,7 +355,7 @@ impl StoreDriver for GCSStore {
         ) -> Result<(), Error> {
             let mut rx = tx.subscribe();
 
-            let body = Body::wrap_stream(ReceiverStream::new(rx));
+            let body = Body::wrap_stream(BroadcastStream::new(rx));
 
             match resumable_client.status(None).await? {
                 UploadStatus::NotStarted => {
@@ -356,7 +383,7 @@ impl StoreDriver for GCSStore {
                         );
 
                         let mut rx = tx.subscribe();
-                        let chunk_body = Body::wrap_stream(ReceiverStream::new(rx));
+                        let chunk_body = Body::wrap_stream(BroadcastStream::new(rx));
 
                         resumable_client
                             .upload_multiple_chunk(chunk_body, &chunk_size)
@@ -376,7 +403,7 @@ impl StoreDriver for GCSStore {
         }
 
         self.retrier
-            .retry(unfold(tx, |tx| async move {
+            .retry(unfold(tx.clone(), move |tx| async move {
                 let retry_result =
                     match retry_upload(&tx, &resumable_client, Arc::clone(&object_name), file_size)
                         .await
@@ -395,7 +422,7 @@ impl StoreDriver for GCSStore {
                         }
                     };
 
-                Some((retry_result, reader))
+                Some((retry_result, tx))
             }))
             .await?;
 
