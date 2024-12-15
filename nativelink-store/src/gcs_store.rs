@@ -28,8 +28,9 @@ use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest};
 use google_cloud_storage::http::resumable_upload_client::ChunkSize;
 use google_cloud_storage::http::resumable_upload_client::ResumableUploadClient;
 use google_cloud_storage::http::resumable_upload_client::UploadStatus;
+use google_cloud_storage::sign::SignedURLOptions;
 use nativelink_config::stores::GCSSpec;
-use nativelink_error::{make_err, Code, Error, GcsError};
+use nativelink_error::{make_err, Code, Error};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
@@ -39,7 +40,10 @@ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use rand::random;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::Body;
-use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
+use reqwest::Client as ReqwestClient;
+use reqwest_middleware::{ClientWithMiddleware, Middleware, RequestBuilder};
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+use tokio_util::io::ReaderStream;
 use tracing::debug;
 
 // Minimum size for GCS multipart uploads.
@@ -116,7 +120,7 @@ impl GCSStore {
     fn build_resumable_session_simple(
         &self,
         base_url: &str,
-        client: &Client,
+        reqwest_client: &ReqwestClient,
         req: &UploadObjectRequest,
         media: &Media,
     ) -> RequestBuilder {
@@ -125,7 +129,8 @@ impl GCSStore {
             base_url,
             utf8_percent_encode(&req.bucket, NON_ALPHANUMERIC)
         );
-        let mut builder = client
+
+        let mut builder = reqwest_client
             .post(url)
             .query(req)
             .query(&[("name", &media.name)])
@@ -144,16 +149,18 @@ impl GCSStore {
         bucket: &str,
         object_name: &str,
         content_length: Option<u64>,
-    ) -> Result<ResumableUploadClient, Error> {
+    ) -> Result<String, Error> {
         let media = Media {
             name: object_name.into(),
             content_type: "application/octet-stream".into(),
             content_length,
         };
 
+        let reqwest_client = reqwest::Client::new();
+
         let request = self.build_resumable_session_simple(
             "https://storage.googleapis.com",
-            &self.gcs_client,
+            &reqwest_client,
             &UploadObjectRequest {
                 bucket: bucket.to_string(),
                 ..Default::default()
@@ -172,13 +179,11 @@ impl GCSStore {
                 .map_err(|_| make_err!(Code::Unavailable, "Invalid session URL"))?
                 .to_string();
 
-            let client_with_middleware: ClientWithMiddleware =
-                ClientWithMiddleware::new(self.gcs_client.clone());
+            let reqwest_client = ReqwestClient::builder()
+                .build()
+                .expect("Failed to create reqwest client");
 
-            Ok(ResumableUploadClient::new(
-                session_url,
-                self.gcs_client.clone(),
-            ))
+            return Ok(session_url);
         } else {
             Err(make_err!(
                 Code::Unavailable,
@@ -275,22 +280,22 @@ impl StoreDriver for GCSStore {
             .await
             .map_err(|e| make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}"))?;
 
-        // Convert `self.gcs_client` to `ClientWithMiddleware`
-        let client_with_middleware: ClientWithMiddleware = self.gcs_client.as_ref().clone().into();
+        let reqwest_client = ReqwestClient::builder()
+            .build()
+            .expect("Failed to create reqwest client");
 
-        let resumable_client =
-            ResumableUploadClient::new(session_url.clone(), client_with_middleware);
+        let resumable_client = ResumableUploadClient::new(session_url, reqwest_client);
 
         self.retrier
             .retry(stream::once(async {
                 let result = async {
                     match resumable_client.status(None).await? {
                         UploadStatus::NotStarted => {
-                            let body = Body::wrap_stream(reader);
+                            let body = Body::wrap_stream(ReaderStream::new(reader));
 
                             // Single chunk upload for small files
                             resumable_client
-                                .upload_single_chunk(reader, file_size as usize)
+                                .upload_single_chunk(body, file_size as usize)
                                 .await
                                 .map_err(|e| {
                                     make_err!(
@@ -301,13 +306,13 @@ impl StoreDriver for GCSStore {
                         }
                         UploadStatus::ResumeIncomplete(range) => {
                             // Resumable chunked upload for large files
-                            let total_size = file_size;
+                            let total_size = file_size as u64;
                             let mut current_position = range.last_byte + 1;
 
                             while current_position < total_size {
                                 let chunk_size = ChunkSize::new(
                                     current_position,
-                                    (current_position + DEFAULT_CHUNK_SIZE - 1).min(total_size - 1),
+                                    (current_position + DEFAULT_CHUNK_SIZE as u64 - 1).min(total_size - 1),
                                     Some(total_size),
                                 );
 
