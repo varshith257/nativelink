@@ -151,51 +151,54 @@ where
     /// Check if the object exists and is not expired
     pub async fn has(self: Pin<&Self>, digest: &StoreKey<'_>) -> Result<Option<u64>, Error> {
         let client = Arc::clone(&self.gcs_client);
-        let cloned_client = (*client).clone();
+
         self.retrier
-            .retry(unfold((), move |state| async move {
-                let object_path = self.make_gcs_path(digest);
-                let request = ReadObjectRequest {
-                    bucket: self.bucket.clone(),
-                    object: object_path.clone(),
-                    ..Default::default()
-                };
+            .retry(unfold((), move |state| {
+                let mut client = (*client).clone();
+                async move {
+                    let object_path = self.make_gcs_path(digest);
+                    let request = ReadObjectRequest {
+                        bucket: self.bucket.clone(),
+                        object: object_path.clone(),
+                        ..Default::default()
+                    };
 
-                let result = cloned_client.read_object(request).await;
+                    let result = client.read_object(request).await;
 
-                match result {
-                    Ok(response) => {
-                        let mut response_stream = response.into_inner();
+                    match result {
+                        Ok(response) => {
+                            let mut response_stream = response.into_inner();
 
-                        // The first message contains the metadata
-                        if let Some(Ok(first_message)) = response_stream.next().await {
-                            if let Some(metadata) = first_message.metadata {
-                                if self.consider_expired_after_s != 0 {
-                                    if let Some(last_modified) = metadata.update_time {
-                                        let now_s = (self.now_fn)().unix_timestamp() as i64;
-                                        if last_modified.seconds + self.consider_expired_after_s
-                                            <= now_s
-                                        {
-                                            return Some((RetryResult::Ok(None), state));
+                            // The first message contains the metadata
+                            if let Some(Ok(first_message)) = response_stream.next().await {
+                                if let Some(metadata) = first_message.metadata {
+                                    if self.consider_expired_after_s != 0 {
+                                        if let Some(last_modified) = metadata.update_time {
+                                            let now_s = (self.now_fn)().unix_timestamp() as i64;
+                                            if last_modified.seconds + self.consider_expired_after_s
+                                                <= now_s
+                                            {
+                                                return Some((RetryResult::Ok(None), state));
+                                            }
                                         }
                                     }
+                                    let length = metadata.size as u64;
+                                    return Some((RetryResult::Ok(Some(length)), state));
                                 }
-                                let length = metadata.size as u64;
-                                return Some((RetryResult::Ok(Some(length)), state));
                             }
+                            Some((RetryResult::Ok(None), state))
                         }
-                        Some((RetryResult::Ok(None), state))
-                    }
-                    Err(status) => match status.code() {
-                        tonic::Code::NotFound => Some((RetryResult::Ok(None), state)),
-                        _ => Some((
-                            RetryResult::Retry(make_err!(
-                                Code::Unavailable,
-                                "Unhandled ReadObject error: {status:?}"
+                        Err(status) => match status.code() {
+                            tonic::Code::NotFound => Some((RetryResult::Ok(None), state)),
+                            _ => Some((
+                                RetryResult::Retry(make_err!(
+                                    Code::Unavailable,
+                                    "Unhandled ReadObject error: {status:?}"
+                                )),
+                                state,
                             )),
-                            state,
-                        )),
-                    },
+                        },
+                    }
                 }
             }))
             .await
@@ -236,6 +239,7 @@ where
         upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
         let gcs_path = self.make_gcs_path(&digest.borrow());
+        let client = Arc::clone(&self.gcs_client);
 
         let max_size = match upload_size {
             UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
@@ -260,39 +264,43 @@ where
 
             return self
                 .retrier
-                .retry(unfold((), move |()| async move {
-                    let write_spec = WriteObjectSpec {
-                        resource: Some(Object {
-                            name: gcs_path.clone(),
+                .retry(unfold((), move |()| {
+                    let mut client = (*client).clone();
+                    let gcs_path = gcs_path.clone();
+                    let data = data.clone();
+                    async move {
+                        let write_spec = WriteObjectSpec {
+                            resource: Some(Object {
+                                name: gcs_path.clone(),
+                                ..Default::default()
+                            }),
+                            object_size: Some(sz as i64),
                             ..Default::default()
-                        }),
-                        object_size: Some(sz as i64),
-                        ..Default::default()
-                    };
+                        };
 
-                    let request_stream = stream::iter(vec![WriteObjectRequest {
-                        first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
-                            write_spec,
-                        )),
-                        data: Some(write_object_request::Data::ChecksummedData(
-                            ChecksummedData {
-                                content: data.to_vec(),
-                                crc32c: Some(crc32c::crc32c(&data)),
-                            },
-                        )),
-                        finish_write: true,
-                        ..Default::default()
-                    }]);
+                        let request_stream = stream::iter(vec![WriteObjectRequest {
+                            first_message: Some(
+                                write_object_request::FirstMessage::WriteObjectSpec(write_spec),
+                            ),
+                            data: Some(write_object_request::Data::ChecksummedData(
+                                ChecksummedData {
+                                    content: data.to_vec(),
+                                    crc32c: Some(crc32c::crc32c(&data)),
+                                },
+                            )),
+                            finish_write: true,
+                            ..Default::default()
+                        }]);
 
-                    let result = self
-                        .gcs_client
-                        .write_object(request_stream)
-                        .await
-                        .map_err(|e| make_err!(Code::Aborted, "WriteObject failed: {e:?}"));
+                        let result = client
+                            .write_object(request_stream)
+                            .await
+                            .map_err(|e| make_err!(Code::Aborted, "WriteObject failed: {e:?}"));
 
-                    match result {
-                        Ok(_) => Some((RetryResult::Ok(()), ())),
-                        Err(e) => Some((RetryResult::Retry(e), ())),
+                        match result {
+                            Ok(_) => Some((RetryResult::Ok(()), ())),
+                            Err(e) => Some((RetryResult::Retry(e), ())),
+                        }
                     }
                 }))
                 .await;
@@ -344,31 +352,36 @@ where
             let is_last_chunk = offset + chunk_size as u64 >= max_size;
 
             self.retrier
-                .retry(unfold(data, move |data| async move {
-                    let request_stream = stream::iter(vec![WriteObjectRequest {
-                        first_message: Some(write_object_request::FirstMessage::UploadId(
-                            upload_id.clone(),
-                        )),
-                        write_offset: offset as i64,
-                        finish_write: is_last_chunk,
-                        data: Some(write_object_request::Data::ChecksummedData(
-                            ChecksummedData {
-                                content: data.to_vec(),
-                                crc32c: Some(crc32c::crc32c(&data)),
-                            },
-                        )),
-                        ..Default::default()
-                    }]);
+                .retry(unfold(data, move |data| {
+                    let mut client = (*client).clone();
+                    let upload_id = upload_id.clone();
+                    let data = data.clone();
 
-                    let result = self
-                        .gcs_client
-                        .write_object(request_stream)
-                        .await
-                        .map_err(|e| make_err!(Code::Aborted, "Failed to upload chunk: {e:?}"));
+                    async move {
+                        let request_stream = stream::iter(vec![WriteObjectRequest {
+                            first_message: Some(write_object_request::FirstMessage::UploadId(
+                                upload_id.clone(),
+                            )),
+                            write_offset: offset as i64,
+                            finish_write: is_last_chunk,
+                            data: Some(write_object_request::Data::ChecksummedData(
+                                ChecksummedData {
+                                    content: data.to_vec(),
+                                    crc32c: Some(crc32c::crc32c(&data)),
+                                },
+                            )),
+                            ..Default::default()
+                        }]);
 
-                    match result {
-                        Ok(_) => Some((RetryResult::Ok(()), data)),
-                        Err(e) => Some((RetryResult::Retry(e), data)),
+                        let result = client
+                            .write_object(request_stream)
+                            .await
+                            .map_err(|e| make_err!(Code::Aborted, "Failed to upload chunk: {e:?}"));
+
+                        match result {
+                            Ok(_) => Some((RetryResult::Ok(()), data)),
+                            Err(e) => Some((RetryResult::Retry(e), data)),
+                        }
                     }
                 }))
                 .await?;
@@ -377,21 +390,23 @@ where
         }
         // Finalize the upload
         self.retrier
-            .retry(unfold((), move |()| async move {
-                let request = QueryWriteStatusRequest {
-                    upload_id: upload_id.clone(),
-                    ..Default::default()
-                };
+            .retry(unfold((), move |()| {
+                let mut client = (*client).clone();
+                let upload_id = upload_id.clone();
+                async move {
+                    let request = QueryWriteStatusRequest {
+                        upload_id: upload_id.clone(),
+                        ..Default::default()
+                    };
 
-                let result = self
-                    .gcs_client
-                    .query_write_status(request)
-                    .await
-                    .map_err(|e| make_err!(Code::Unavailable, "Failed to finalize upload: {e:?}"));
+                    let result = client.query_write_status(request).await.map_err(|e| {
+                        make_err!(Code::Unavailable, "Failed to finalize upload: {e:?}")
+                    });
 
-                match result {
-                    Ok(_) => Some((RetryResult::Ok(()), ())),
-                    Err(e) => Some((RetryResult::Retry(e), ())),
+                    match result {
+                        Ok(_) => Some((RetryResult::Ok(()), ())),
+                        Err(e) => Some((RetryResult::Retry(e), ())),
+                    }
                 }
             }))
             .await?;
@@ -427,7 +442,7 @@ where
                     };
 
                     let client = Arc::clone(&self.gcs_client);
-                    let cloned_client = (*client).clone();
+                    let mut cloned_client = (*client).clone();
 
                     let result = cloned_client.read_object(request).await;
 
