@@ -345,6 +345,7 @@ where
         let mut offset = 0;
         let chunk_size = self.resumable_chunk_size;
         let value = upload_id.clone();
+
         while offset < max_size {
             let data = reader
                 .consume(Some(chunk_size))
@@ -357,8 +358,9 @@ where
                 .retry(unfold(data, move |data| {
                     let client = Arc::clone(&client);
                     let mut client = (*client).clone();
+                    let upload_id = upload_id.clone();
                     let data = data.clone();
-                    let upload_id = &value;
+                    let offset = offset;
 
                     async move {
                         let request_stream = stream::iter(vec![WriteObjectRequest {
@@ -391,6 +393,9 @@ where
 
             offset += chunk_size as u64;
         }
+
+        let client = Arc::clone(&self.gcs_client);
+
         // Finalize the upload
         self.retrier
             .retry(unfold((), move |()| {
