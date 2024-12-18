@@ -53,6 +53,7 @@ rust_library(
         "@crates//:bytes",
         "@crates//:bytes-utils",
         "@crates//:const_format",
+        "@crates//:crc32c",
         "@crates//:filetime",
         "@crates//:fred",
         "@crates//:futures",

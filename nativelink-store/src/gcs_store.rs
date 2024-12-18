@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crc32c;
+use crc32c::crc32c;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
@@ -396,8 +396,6 @@ where
 
             offset += chunk_size as u64;
         }
-
-        let client = Arc::clone(&self.gcs_client);
 
         // Finalize the upload
         self.retrier
