@@ -76,7 +76,7 @@ const CHUNK_BUFFER_SIZE: usize = 64 * 1024;
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
-    gcs_client: Arc<StorageClient<Channel>>,
+    gcs_client: Arc<Mutex<StorageClient<Channel>>>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
@@ -161,7 +161,8 @@ where
                     ..Default::default()
                 };
 
-                let result = self.gcs_client.read_object(request).await;
+                let mut client = self.gcs_client.lock().await;
+                let result = client.read_object(request).await;
 
                 match result {
                     Ok(response) => {
