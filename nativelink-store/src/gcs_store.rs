@@ -76,7 +76,7 @@ const CHUNK_BUFFER_SIZE: usize = 64 * 1024;
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
-    gcs_client: Arc<Mutex<StorageClient<Channel>>>,
+    gcs_client: StorageClient<Channel>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
@@ -161,12 +161,12 @@ where
                     ..Default::default()
                 };
 
-                let mut client = self.gcs_client.lock().await;
+                let mut client = self.gcs_client.clone();
                 let result = client.read_object(request).await;
 
                 match result {
                     Ok(response) => {
-                        let response_stream = response.into_inner();
+                        let mut response_stream = response.into_inner();
 
                         // The first message contains the metadata
                         if let Some(Ok(first_message)) = response_stream.next().await {
