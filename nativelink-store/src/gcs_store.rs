@@ -238,7 +238,6 @@ where
         upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
         let gcs_path = self.make_gcs_path(&digest.borrow());
-        let client = Arc::clone(&self.gcs_client);
 
         let max_size = match upload_size {
             UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
@@ -311,7 +310,7 @@ where
         let upload_id = self
             .retrier
             .retry(unfold((), move |()| {
-                let client = Arc::clone(&client);
+                let client = Arc::clone(&self.gcs_client);
                 let mut client = (*client).clone();
                 let gcs_path = gcs_path.clone();
                 async move {
@@ -360,6 +359,7 @@ where
 
             self.retrier
                 .retry(unfold(data, move |data| {
+                    let client = Arc::clone(&self.gcs_client);
                     let mut client = (*client).clone();
                     let upload_id = Arc::clone(&upload_id);
                     let data = data.clone();
@@ -402,7 +402,7 @@ where
         // Finalize the upload
         self.retrier
             .retry(unfold((), move |()| {
-                let client = Arc::clone(&client);
+                let client = Arc::clone(&self.gcs_client);
                 let mut client = (*client).clone();
                 let upload_id = Arc::clone(&upload_id);
                 async move {
