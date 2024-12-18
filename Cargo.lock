@@ -1350,9 +1350,9 @@ dependencies = [
 
 [[package]]
 name = "googleapis-tonic-google-storage-v2"
-version = "0.17.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ed06b3db0041d905c8f5f4b6e095d84fe64d4b426ffff3d383841a3115a4e51"
+checksum = "1e93e7cde66413a2bcedf7c5aa9c1ea36a17d3bccaa680cc931434db295f1769"
 dependencies = [
  "googleapis-tonic-google-api",
  "googleapis-tonic-google-iam-v1",
@@ -2222,6 +2222,7 @@ dependencies = [
  "bytes",
  "bytes-utils",
  "const_format",
+ "crc32c",
  "filetime",
  "fred",
  "futures",

@@ -15,39 +15,31 @@
 use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::{unfold, FuturesUnordered, Stream};
-use futures::{stream, Future, StreamExt};
-use googleapis_tonic_google_storage_v2::google::api::HttpBody;
+use crc32c::crc32c;
+use futures::stream::{unfold, FuturesUnordered};
+use futures::{StreamExt, TryStreamExt};
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
-    storage_client::StorageClient, DeleteObjectRequest, QueryWriteStatusRequest, ReadObjectRequest,
-    StartResumableWriteRequest, WriteObjectRequest, WriteObjectSpec,
+    storage_client::StorageClient, write_object_request, ChecksummedData, Object,
+    QueryWriteStatusRequest, ReadObjectRequest, StartResumableWriteRequest, WriteObjectRequest,
+    WriteObjectSpec,
 };
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error, ResultExt};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{
-    make_buf_channel_pair, DropCloserReadHalf, DropCloserWriteHalf,
-};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
-use rand::random;
 use rand::rngs::OsRng;
 use rand::Rng;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::sync::{mpsc, SemaphorePermit};
 use tokio::time::sleep;
 use tonic::transport::Channel;
-use tonic::Status;
 
-use tracing::{event, Level};
+// use tracing::{event, Level};
 
 use crate::cas_utils::is_zero_digest;
 
@@ -98,7 +90,7 @@ pub struct GCSStore<NowFn> {
     resumable_max_concurrent_uploads: usize,
 }
 
-impl<NowFn> GCSStore<NowFn>
+impl<I, NowFn> GCSStore<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
@@ -147,6 +139,7 @@ where
             resumable_chunk_size: spec
                 .resumable_chunk_size
                 .unwrap_or(DEFAULT_CHUNK_SIZE as usize),
+            resumable_max_concurrent_uploads: todo!(),
         }))
     }
 
@@ -169,17 +162,26 @@ where
 
                 match result {
                     Ok(response) => {
-                        let object_metadata = response.into_inner();
-                        if self.consider_expired_after_s != 0 {
-                            if let Some(last_modified) = object_metadata.update_time {
-                                let now_s = (self.now_fn)().unix_timestamp() as i64;
-                                if last_modified.seconds + self.consider_expired_after_s <= now_s {
-                                    return Some((RetryResult::Ok(None), state));
+                        let mut response_stream = response.into_inner();
+
+                        // The first message contains the metadata
+                        if let Some(Ok(first_message)) = response_stream.next().await {
+                            if let Some(metadata) = first_message.metadata {
+                                if self.consider_expired_after_s != 0 {
+                                    if let Some(last_modified) = metadata.update_time {
+                                        let now_s = (self.now_fn)().unix_timestamp() as i64;
+                                        if last_modified.seconds + self.consider_expired_after_s
+                                            <= now_s
+                                        {
+                                            return Some((RetryResult::Ok(None), state));
+                                        }
+                                    }
                                 }
+                                let length = metadata.size as u64;
+                                return Some((RetryResult::Ok(Some(length)), state));
                             }
                         }
-                        let length = object_metadata.size;
-                        Some((RetryResult::Ok(Some(length as u64)), state))
+                        Some((RetryResult::Ok(None), state))
                     }
                     Err(status) => match status.code() {
                         tonic::Code::NotFound => Some((RetryResult::Ok(None), state)),
@@ -413,7 +415,7 @@ where
                     bucket: self.bucket.clone(),
                     object: gcs_path.clone(),
                     read_offset: offset as i64,
-                    read_limit: length.map(|l| l as i64),
+                    read_limit: length.unwrap_or(0) as i64,
                     ..Default::default()
                 };
 
@@ -445,12 +447,12 @@ where
                 while let Some(chunk) = response_stream.next().await {
                     match chunk {
                         Ok(data) => {
-                            if let Some(content) = data.content {
-                                if content.is_empty() {
+                            if let Some(checksummed_data) = data.checksummed_data {
+                                if checksummed_data.content.is_empty() {
                                     // Ignore empty chunks
                                     continue;
                                 }
-                                if let Err(e) = writer.send(content).await {
+                                if let Err(e) = writer.send(checksummed_data.content).await {
                                     return Some((
                                         RetryResult::Err(make_err!(
                                             Code::Aborted,
@@ -502,7 +504,11 @@ where
 }
 
 #[async_trait]
-impl HealthStatusIndicator for GCSStore {
+impl<I, NowFn> HealthStatusIndicator for GCSStore<NowFn>
+where
+    I: InstantWrapper,
+    NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
+{
     fn get_name(&self) -> &'static str {
         "GCSStore"
     }
