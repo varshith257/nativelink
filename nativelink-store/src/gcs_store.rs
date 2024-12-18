@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crc32c::crc32c;
+use crc32c;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
@@ -369,7 +369,7 @@ where
                     async move {
                         let request_stream = stream::iter(vec![WriteObjectRequest {
                             first_message: Some(write_object_request::FirstMessage::UploadId(
-                                upload_id.clone(),
+                                (*upload_id).clone(),
                             )),
                             write_offset: offset as i64,
                             finish_write: is_last_chunk,
@@ -408,7 +408,7 @@ where
                 let upload_id = Arc::clone(&upload_id);
                 async move {
                     let request = QueryWriteStatusRequest {
-                        upload_id: upload_id.clone(),
+                        upload_id: (*upload_id).clone(),
                         ..Default::default()
                     };
 
