@@ -309,39 +309,42 @@ where
         // Start a resumable write session for larger files
         let upload_id = self
             .retrier
-            .retry(unfold((), move |()| async move {
-                let write_spec = WriteObjectSpec {
-                    resource: Some(Object {
-                        name: gcs_path.clone(),
+            .retry(unfold((), move |()| {
+                let mut client = (*client).clone();
+                let gcs_path = gcs_path.clone();
+                let upload_id = upload_id.clone();
+                async move {
+                    let write_spec = WriteObjectSpec {
+                        resource: Some(Object {
+                            name: gcs_path.clone(),
+                            ..Default::default()
+                        }),
+                        object_size: Some(max_size as i64),
                         ..Default::default()
-                    }),
-                    object_size: Some(max_size as i64),
-                    ..Default::default()
-                };
+                    };
 
-                let request = StartResumableWriteRequest {
-                    write_object_spec: Some(write_spec),
-                    ..Default::default()
-                };
+                    let request = StartResumableWriteRequest {
+                        write_object_spec: Some(write_spec),
+                        ..Default::default()
+                    };
 
-                let result = self
-                    .gcs_client
-                    .start_resumable_write(request)
-                    .await
-                    .map_err(|e| {
+                    let result = client.start_resumable_write(request).await.map_err(|e| {
                         make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}")
                     });
 
-                match result {
-                    Ok(response) => Some((RetryResult::Ok(response.into_inner().upload_id), ())),
-                    Err(e) => Some((RetryResult::Retry(e), ())),
+                    match result {
+                        Ok(response) => {
+                            Some((RetryResult::Ok(response.into_inner().upload_id), ()))
+                        }
+                        Err(e) => Some((RetryResult::Retry(e), ())),
+                    }
                 }
             }))
             .await?;
 
         // Chunked upload loop
         let mut offset = 0;
-        let mut chunk_size = self.resumable_chunk_size;
+        let chunk_size = self.resumable_chunk_size;
 
         while offset < max_size {
             let data = reader
