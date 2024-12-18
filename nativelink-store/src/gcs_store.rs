@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use crc32c::crc32c;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
@@ -263,6 +264,7 @@ where
             return self
                 .retrier
                 .retry(unfold((), move |()| {
+                    let client = Arc::clone(&self.gcs_client);
                     let mut client = (*client).clone();
                     let gcs_path = gcs_path.clone();
                     let data = data.clone();
@@ -344,7 +346,7 @@ where
         // Chunked upload loop
         let mut offset = 0;
         let chunk_size = self.resumable_chunk_size;
-        let value = upload_id.clone();
+        let upload_id = Arc::new(upload_id);
 
         while offset < max_size {
             let data = reader
@@ -354,11 +356,13 @@ where
 
             let is_last_chunk = offset + chunk_size as u64 >= max_size;
 
+            let upload_id = Arc::clone(&upload_id);
+
             self.retrier
                 .retry(unfold(data, move |data| {
                     let client = Arc::clone(&client);
                     let mut client = (*client).clone();
-                    let upload_id = upload_id.clone();
+                    let upload_id = Arc::clone(&upload_id);
                     let data = data.clone();
                     let offset = offset;
 
@@ -401,7 +405,7 @@ where
             .retry(unfold((), move |()| {
                 let client = Arc::clone(&client);
                 let mut client = (*client).clone();
-                let upload_id = upload_id.clone();
+                let upload_id = Arc::clone(&upload_id);
                 async move {
                     let request = QueryWriteStatusRequest {
                         upload_id: upload_id.clone(),
