@@ -19,8 +19,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use crc32c::crc32c;
+use futures::stream;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
+// use tokio_stream::StreamExt;
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     storage_client::StorageClient, write_object_request, ChecksummedData, Object,
     QueryWriteStatusRequest, ReadObjectRequest, StartResumableWriteRequest, WriteObjectRequest,
@@ -36,6 +38,7 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rand::rngs::OsRng;
 use rand::Rng;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
@@ -162,7 +165,7 @@ where
 
                 match result {
                     Ok(response) => {
-                        let mut response_stream = response.into_inner();
+                        let response_stream = response.into_inner();
 
                         // The first message contains the metadata
                         if let Some(Ok(first_message)) = response_stream.next().await {
@@ -267,23 +270,23 @@ where
                         ..Default::default()
                     };
 
-                    let request = WriteObjectRequest {
+                    let request_stream = stream::iter(vec![Ok(WriteObjectRequest {
                         first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
                             write_spec,
                         )),
                         data: Some(write_object_request::Data::ChecksummedData(
                             ChecksummedData {
-                                content: data.clone(),
+                                content: data.to_vec(),
                                 crc32c: Some(crc32c::crc32c(&data)),
                             },
                         )),
                         finish_write: true,
                         ..Default::default()
-                    };
+                    })]);
 
                     let result = self
                         .gcs_client
-                        .write_object(request)
+                        .write_object(request_stream)
                         .await
                         .map_err(|e| make_err!(Code::Aborted, "WriteObject failed: {e:?}"));
 
@@ -338,26 +341,28 @@ where
                 .await
                 .err_tip(|| "Failed to read data for chunked upload")?;
 
-            let is_last_chunk = offset + chunk_size >= max_size;
+            let is_last_chunk = offset + chunk_size as u64 >= max_size;
 
             self.retrier
                 .retry(unfold(data, move |data| async move {
-                    let request = WriteObjectRequest {
-                        upload_id: Some(upload_id.clone()),
+                    let request_stream = stream::iter(vec![Ok(WriteObjectRequest {
+                        first_message: Some(write_object_request::FirstMessage::UploadId(
+                            upload_id.clone(),
+                        )),
                         write_offset: offset as i64,
                         finish_write: is_last_chunk,
                         data: Some(write_object_request::Data::ChecksummedData(
                             ChecksummedData {
-                                content: data.clone(),
+                                content: data.to_vec(),
                                 crc32c: Some(crc32c::crc32c(&data)),
                             },
                         )),
                         ..Default::default()
-                    };
+                    })]);
 
                     let result = self
                         .gcs_client
-                        .write_object(request)
+                        .write_object(request_stream)
                         .await
                         .map_err(|e| make_err!(Code::Aborted, "Failed to upload chunk: {e:?}"));
 
@@ -368,7 +373,7 @@ where
                 }))
                 .await?;
 
-            offset += chunk_size;
+            offset += chunk_size as u64;
         }
         // Finalize the upload
         self.retrier
@@ -452,7 +457,7 @@ where
                                     // Ignore empty chunks
                                     continue;
                                 }
-                                if let Err(e) = writer.send(checksummed_data.content).await {
+                                if let Err(e) = writer.send(checksummed_data.content.into()).await {
                                     return Some((
                                         RetryResult::Err(make_err!(
                                             Code::Aborted,
