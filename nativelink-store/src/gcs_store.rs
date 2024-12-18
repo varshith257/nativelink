@@ -347,7 +347,6 @@ where
         let mut offset = 0;
         let chunk_size = self.resumable_chunk_size;
 
-        let mut value = upload_id.clone();
         while offset < max_size {
             let data = reader
                 .consume(Some(chunk_size))
@@ -358,8 +357,9 @@ where
 
             self.retrier
                 .retry(unfold(data, move |data| {
+                    let client = Arc::clone(&client);
                     let mut client = (*client).clone();
-                    let upload_id = value;
+                    let upload_id = upload_id.clone();
                     let data = data.clone();
 
                     async move {
