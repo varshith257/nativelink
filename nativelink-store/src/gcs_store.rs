@@ -18,9 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream;
 use futures::stream::{unfold, FuturesUnordered};
-use futures::{StreamExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     storage_client::StorageClient, write_object_request, ChecksummedData, Object,
@@ -41,7 +40,6 @@ use tokio::time::sleep;
 use tonic::transport::Channel;
 
 // use tracing::{event, Level};
-
 use crate::cas_utils::is_zero_digest;
 
 // # How is this Different from the S3 Store Implementation
@@ -312,7 +310,6 @@ where
             .retrier
             .retry(unfold((), move |()| {
                 let client = Arc::clone(&client);
-                let mut client = (*client).clone();
                 let gcs_path = gcs_path.clone();
                 async move {
                     let write_spec = WriteObjectSpec {
@@ -346,7 +343,7 @@ where
         // Chunked upload loop
         let mut offset = 0;
         let chunk_size = self.resumable_chunk_size;
-
+        let mut value = upload_id.clone();
         while offset < max_size {
             let data = reader
                 .consume(Some(chunk_size))
@@ -361,6 +358,7 @@ where
                     let mut client = (*client).clone();
                     let upload_id = upload_id.clone();
                     let data = data.clone();
+                    let upload_id = value;
 
                     async move {
                         let request_stream = stream::iter(vec![WriteObjectRequest {
