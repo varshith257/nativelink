@@ -310,6 +310,7 @@ where
             .retrier
             .retry(unfold((), move |()| {
                 let client = Arc::clone(&client);
+                let mut client = (*client).clone();
                 let gcs_path = gcs_path.clone();
                 async move {
                     let write_spec = WriteObjectSpec {
@@ -343,7 +344,7 @@ where
         // Chunked upload loop
         let mut offset = 0;
         let chunk_size = self.resumable_chunk_size;
-        let mut value = upload_id.clone();
+        let value = upload_id.clone();
         while offset < max_size {
             let data = reader
                 .consume(Some(chunk_size))
@@ -356,9 +357,8 @@ where
                 .retry(unfold(data, move |data| {
                     let client = Arc::clone(&client);
                     let mut client = (*client).clone();
-                    let upload_id = upload_id.clone();
                     let data = data.clone();
-                    let upload_id = value;
+                    let upload_id = &value;
 
                     async move {
                         let request_stream = stream::iter(vec![WriteObjectRequest {
@@ -394,6 +394,7 @@ where
         // Finalize the upload
         self.retrier
             .retry(unfold((), move |()| {
+                let client = Arc::clone(&client);
                 let mut client = (*client).clone();
                 let upload_id = upload_id.clone();
                 async move {
