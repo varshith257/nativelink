@@ -151,6 +151,7 @@ where
 
     /// Check if the object exists and is not expired
     pub async fn has(self: Pin<&Self>, digest: &StoreKey<'_>) -> Result<Option<u64>, Error> {
+        let client = Arc::clone(&self.gcs_client);
         self.retrier
             .retry(unfold((), move |state| async move {
                 let object_path = self.make_gcs_path(digest);
@@ -160,7 +161,6 @@ where
                     ..Default::default()
                 };
 
-                let mut client = self.gcs_client.clone();
                 let result = client.read_object(request).await;
 
                 match result {
@@ -413,86 +413,90 @@ where
         }
 
         let gcs_path = self.make_gcs_path(&key);
+        let client = Arc::clone(&self.gcs_client);
 
         self.retrier
-            .retry(unfold(writer, move |writer| async move {
+            .retry(unfold(writer, move |writer| {
                 let path = gcs_path.clone();
-                let request = ReadObjectRequest {
-                    bucket: self.bucket.clone(),
-                    object: path.clone(),
-                    read_offset: offset as i64,
-                    read_limit: length.unwrap_or(0) as i64,
-                    ..Default::default()
-                };
+                async move {
+                    let request = ReadObjectRequest {
+                        bucket: self.bucket.clone(),
+                        object: path.clone(),
+                        read_offset: offset as i64,
+                        read_limit: length.unwrap_or(0) as i64,
+                        ..Default::default()
+                    };
 
-                let mut client = self.gcs_client.clone();
-                let result = client.read_object(request).await;
+                    let result = client.read_object(request).await;
 
-                let mut response_stream = match result {
-                    Ok(response) => response.into_inner(),
-                    Err(status) if status.code() == tonic::Code::NotFound => {
-                        return Some((
-                            RetryResult::Err(make_err!(
-                                Code::NotFound,
-                                "GCS object not found: {gcs_path}"
-                            )),
-                            writer,
-                        ));
-                    }
-                    Err(e) => {
-                        return Some((
-                            RetryResult::Retry(make_err!(
-                                Code::Unavailable,
-                                "Failed to initiate read for GCS object: {e:?}"
-                            )),
-                            writer,
-                        ));
-                    }
-                };
-
-                // Stream data from the GCS response to the writer
-                while let Some(chunk) = response_stream.next().await {
-                    match chunk {
-                        Ok(data) => {
-                            if let Some(checksummed_data) = data.checksummed_data {
-                                if checksummed_data.content.is_empty() {
-                                    // Ignore empty chunks
-                                    continue;
-                                }
-                                if let Err(e) = writer.send(checksummed_data.content.into()).await {
-                                    return Some((
-                                        RetryResult::Err(make_err!(
-                                            Code::Aborted,
-                                            "Failed to send bytes to writer in GCS: {e:?}"
-                                        )),
-                                        writer,
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
+                    let mut response_stream = match result {
+                        Ok(response) => response.into_inner(),
+                        Err(status) if status.code() == tonic::Code::NotFound => {
                             return Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::Aborted,
-                                    "Error in GCS response stream: {e:?}"
+                                RetryResult::Err(make_err!(
+                                    Code::NotFound,
+                                    "GCS object not found: {gcs_path}"
                                 )),
                                 writer,
                             ));
                         }
+                        Err(e) => {
+                            return Some((
+                                RetryResult::Retry(make_err!(
+                                    Code::Unavailable,
+                                    "Failed to initiate read for GCS object: {e:?}"
+                                )),
+                                writer,
+                            ));
+                        }
+                    };
+
+                    // Stream data from the GCS response to the writer
+                    while let Some(chunk) = response_stream.next().await {
+                        match chunk {
+                            Ok(data) => {
+                                if let Some(checksummed_data) = data.checksummed_data {
+                                    if checksummed_data.content.is_empty() {
+                                        // Ignore empty chunks
+                                        continue;
+                                    }
+                                    if let Err(e) =
+                                        writer.send(checksummed_data.content.into()).await
+                                    {
+                                        return Some((
+                                            RetryResult::Err(make_err!(
+                                                Code::Aborted,
+                                                "Failed to send bytes to writer in GCS: {e:?}"
+                                            )),
+                                            writer,
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                return Some((
+                                    RetryResult::Retry(make_err!(
+                                        Code::Aborted,
+                                        "Error in GCS response stream: {e:?}"
+                                    )),
+                                    writer,
+                                ));
+                            }
+                        }
                     }
-                }
 
-                if let Err(e) = writer.send_eof() {
-                    return Some((
-                        RetryResult::Err(make_err!(
-                            Code::Aborted,
-                            "Failed to send EOF to writer in GCS: {e:?}"
-                        )),
-                        writer,
-                    ));
-                }
+                    if let Err(e) = writer.send_eof() {
+                        return Some((
+                            RetryResult::Err(make_err!(
+                                Code::Aborted,
+                                "Failed to send EOF to writer in GCS: {e:?}"
+                            )),
+                            writer,
+                        ));
+                    }
 
-                Some((RetryResult::Ok(()), writer))
+                    Some((RetryResult::Ok(()), writer))
+                }
             }))
             .await
     }
