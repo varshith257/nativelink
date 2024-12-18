@@ -360,7 +360,6 @@ where
 
             self.retrier
                 .retry(unfold(data, move |data| {
-                    let client = Arc::clone(&client);
                     let mut client = (*client).clone();
                     let upload_id = Arc::clone(&upload_id);
                     let data = data.clone();
