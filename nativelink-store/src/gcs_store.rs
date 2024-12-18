@@ -141,7 +141,7 @@ where
             resumable_chunk_size: spec
                 .resumable_chunk_size
                 .unwrap_or(DEFAULT_CHUNK_SIZE as usize),
-            resumable_max_concurrent_uploads: todo!(),
+            resumable_max_concurrent_uploads: 0,
         }))
     }
 
@@ -416,15 +416,17 @@ where
 
         self.retrier
             .retry(unfold(writer, move |writer| async move {
+                let path = gcs_path.clone();
                 let request = ReadObjectRequest {
                     bucket: self.bucket.clone(),
-                    object: gcs_path.clone(),
+                    object: path.clone(),
                     read_offset: offset as i64,
                     read_limit: length.unwrap_or(0) as i64,
                     ..Default::default()
                 };
 
-                let result = self.gcs_client.read_object(request).await;
+                let mut client = self.gcs_client.clone();
+                let result = client.read_object(request).await;
 
                 let mut response_stream = match result {
                     Ok(response) => response.into_inner(),
