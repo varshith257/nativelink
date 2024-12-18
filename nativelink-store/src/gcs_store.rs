@@ -21,37 +21,55 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{unfold, FuturesUnordered, Stream};
 use futures::{stream, Future, StreamExt};
-use google_cloud_storage::client::{Client, ClientConfig};
-use google_cloud_storage::http::objects::download::Range;
-use google_cloud_storage::http::objects::get::GetObjectRequest;
-use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest};
-use google_cloud_storage::http::resumable_upload_client::{
-    ChunkSize, ResumableUploadClient, UploadStatus,
+use googleapis_tonic_google_storage_v2::google::api::HttpBody;
+use googleapis_tonic_google_storage_v2::google::storage::v2::{
+    storage_client::StorageClient, DeleteObjectRequest, QueryWriteStatusRequest, ReadObjectRequest,
+    StartResumableWriteRequest, WriteObjectRequest, WriteObjectSpec,
 };
 use nativelink_config::stores::GCSSpec;
-use nativelink_error::{make_err, Code, Error};
+use nativelink_error::{make_err, Code, Error, ResultExt};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{
+    make_buf_channel_pair, DropCloserReadHalf, DropCloserWriteHalf,
+};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
+use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use rand::random;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
-use reqwest::{Body, Client as ReqwestClient};
-use reqwest_middleware::{ClientWithMiddleware, Middleware};
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::broadcast::Receiver;
+use rand::rngs::OsRng;
+use rand::Rng;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tokio::sync::{mpsc, SemaphorePermit};
+use tokio::time::sleep;
+use tonic::transport::Channel;
+use tonic::Status;
 
-// Minimum size for GCS multipart uploads.
-// Note: If you change this, adjust the docs in the config.
-const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024;
+use tracing::{event, Level};
 
-// Maximum size for GCS multipart uploads.
-// Note: If you change this, adjust the docs in the config.
-const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+use crate::cas_utils::is_zero_digest;
+
+// # How is this Different from the S3 Store Implementation
+//
+// The GCS store implementation differs from the S3 store implementation in several ways, reflecting
+// differences in underlying APIs and service capabilities. This section provides a summary of key
+// differences relevant to the **store implementation** for maintainability and reviewability:
+
+// TODO: Add more reviewable docs comments
+/*
+---
+
+### **Rationale for Implementation Differences**
+
+The GCS store implementation adheres to the requirements and limitations of Google Cloud Storage's gRPC API. 
+Sequential chunk uploads, explicit session handling and checksum validation reflect the service's design.
+In contrast, S3's multipart upload API simplifies concurrency, error handling, and session management.
+
+These differences emphasize the need for tailored approaches to storage backends while maintaining a consistent abstraction layer for higher-level operations.
+---
+*/
 
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
@@ -60,421 +78,316 @@ const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 // Note: If you change this, adjust the docs in the config.
 const CHUNK_BUFFER_SIZE: usize = 64 * 1024;
 
-/// A wrapper around `tokio::sync::broadcast::Receiver` that implements the `Stream` trait.
-///
-/// # Purpose
-/// `BroadcastStream` bridges the gap between `tokio::sync::broadcast` and the `Stream` trait,
-/// enabling seamless integration of broadcast channels with streaming-based APIs.
-///
-/// # Use Case in GCSStore
-/// In the context of `GCSStore`, this wrapper allows chunked file uploads to be efficiently
-/// streamed to Google Cloud Storage (GCS). Each chunk of data is broadcasted to all subscribers
-/// (e.g., for retry logic or parallel consumers). The `Stream` implementation makes it compatible
-/// with APIs like `Body::wrap_stream` which simplifies the upload process.
-///
-/// # Benefits
-/// - Converts the push-based `broadcast::Receiver` into a pull-based `Stream`, enabling compatibility
-///   with `Stream`-based APIs.
-/// - Handles error cases gracefully, converting `RecvError::Closed` to `None` to signal stream completion.
-/// - Allows multiple consumers to read from the same broadcasted data stream, useful for parallel processing.
-///
-struct BroadcastStream<T> {
-    receiver: Receiver<T>,
-}
-
-impl<T: Clone> BroadcastStream<T> {
-    fn new(receiver: Receiver<T>) -> Self {
-        BroadcastStream { receiver }
-    }
-}
-
-impl<T: Clone + Send + 'static> Stream for BroadcastStream<T> {
-    type Item = Result<T, RecvError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        let recv_future = this.receiver.recv();
-
-        match Box::pin(recv_future).as_mut().poll(cx) {
-            Poll::Ready(Ok(value)) => Poll::Ready(Some(Ok(value))),
-            Poll::Ready(Err(RecvError::Closed)) => Poll::Ready(None),
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 #[derive(MetricsComponent)]
-pub struct GCSStore {
-    #[metric(help = "The bucket name used for GCSStore")]
+pub struct GCSStore<NowFn> {
+    // The gRPC client for GCS
+    gcs_client: Arc<StorageClient<Channel>>,
+    now_fn: NowFn,
+    #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
-    #[metric(help = "The key prefix used for objects in GCSStore")]
+    #[metric(help = "The key prefix for the GCS store")]
     key_prefix: String,
-    #[metric(help = "Number of retry attempts in GCS operations")]
-    retry_count: usize,
-    #[metric(help = "Total bytes uploaded to GCS")]
-    uploaded_bytes: u64,
-    #[metric(help = "Total bytes downloaded from GCS")]
-    downloaded_bytes: u64,
-    gcs_client: Arc<Client>,
     retrier: Retrier,
+    #[metric(help = "The number of seconds to consider an object expired")]
+    consider_expired_after_s: i64,
+    #[metric(help = "The number of bytes to buffer for retrying requests")]
+    max_retry_buffer_per_request: usize,
+    #[metric(help = "The size of chunks for resumable uploads")]
+    resumable_chunk_size: usize,
+    #[metric(help = "The number of concurrent uploads allowed for resumable uploads")]
+    resumable_max_concurrent_uploads: usize,
 }
 
-impl GCSStore {
-    pub async fn new(spec: &GCSSpec) -> Result<Arc<Self>, Error> {
-        let client = ClientConfig::default()
-            .with_auth()
+impl<NowFn> GCSStore<NowFn>
+where
+    I: InstantWrapper,
+    NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
+{
+    pub async fn new(spec: &GCSSpec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
+        let jitter_amt = spec.retry.jitter;
+        let jitter_fn = Arc::new(move |delay: Duration| {
+            if jitter_amt == 0. {
+                return delay;
+            }
+            let min = 1. - (jitter_amt / 2.);
+            let max = 1. + (jitter_amt / 2.);
+            delay.mul_f32(OsRng.gen_range(min..max))
+        });
+
+        let channel = tonic::transport::Channel::from_static("https://storage.googleapis.com")
+            .connect()
             .await
-            .map(Client::new)
-            .map(Arc::new)
-            .map_err(|e| make_err!(Code::Unavailable, "Failed to initialize GCS client: {e:?}"))?;
+            .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
 
-        let retry_jitter = spec.retry.jitter;
-        let retry_delay = spec.retry.delay;
+        let gcs_client = StorageClient::new(channel);
 
-        let retrier = Retrier::new(
-            Arc::new(move |duration| {
-                // Jitter: +/-50% random variation
-                // This helps distribute retries more evenly and prevents synchronized bursts.
-                // Reference: https://cloud.google.com/storage/docs/retry-strategy#exponential-backoff
-                let jitter = random::<f32>() * (retry_jitter / 2.0);
-                let backoff_with_jitter = duration.mul_f32(1.0 + jitter);
-                Box::pin(tokio::time::sleep(backoff_with_jitter))
-            }),
-            Arc::new(move |delay| {
-                // Exponential backoff: Multiply delay by 2, with an upper cap
-                let retry_delay = retry_delay;
-                let exponential_backoff = delay.mul_f32(2.0);
-                Duration::from_secs_f32(retry_delay).min(exponential_backoff)
-            }),
-            spec.retry.clone(),
-        );
+        Self::new_with_client_and_jitter(spec, gcs_client, jitter_fn, now_fn)
+    }
 
+    pub fn new_with_client_and_jitter(
+        spec: &GCSSpec,
+        gcs_client: StorageClient<tonic::transport::Channel>,
+        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
+        now_fn: NowFn,
+    ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
-            bucket: spec.bucket.clone(),
-            key_prefix: spec.key_prefix.clone().unwrap_or_default(),
-            gcs_client: client,
-            retrier,
-            retry_count: 0,
-            uploaded_bytes: 0,
-            downloaded_bytes: 0,
+            gcs_client: Arc::new(gcs_client),
+            now_fn,
+            bucket: spec.bucket.to_string(),
+            key_prefix: spec.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
+            retrier: Retrier::new(
+                Arc::new(|duration| Box::pin(sleep(duration))),
+                jitter_fn,
+                spec.retry.clone(),
+            ),
+            consider_expired_after_s: spec.consider_expired_after_s as i64,
+            max_retry_buffer_per_request: spec
+                .max_retry_buffer_per_request
+                .unwrap_or(DEFAULT_CHUNK_SIZE as usize),
+            resumable_chunk_size: spec
+                .resumable_chunk_size
+                .unwrap_or(DEFAULT_CHUNK_SIZE as usize),
         }))
     }
+
     fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
         format!("{}{}", self.key_prefix, key.as_str())
     }
 
-    fn build_resumable_session_simple(
-        &self,
-        base_url: &str,
-        reqwest_client: &ReqwestClient,
-        req: &UploadObjectRequest,
-        media: &Media,
-    ) -> reqwest::RequestBuilder {
-        let url = format!(
-            "{}/b/{}/o?uploadType=resumable",
-            base_url,
-            utf8_percent_encode(&req.bucket, NON_ALPHANUMERIC)
-        );
+    /// Check if the object exists and is not expired
+    pub async fn has(self: Pin<&Self>, digest: &StoreKey<'_>) -> Result<Option<u64>, Error> {
+        self.retrier
+            .retry(unfold((), move |state| async move {
+                let object_path = self.make_gcs_path(digest);
+                let request = ReadObjectRequest {
+                    bucket: self.bucket.clone(),
+                    object: object_path.clone(),
+                    ..Default::default()
+                };
 
-        let mut builder = reqwest_client
-            .post(url)
-            .query(req)
-            .query(&[("name", &media.name)])
-            .header(CONTENT_TYPE, media.content_type.to_string())
-            .header(CONTENT_LENGTH, "0");
+                let result = self.gcs_client.read_object(request).await;
 
-        if let Some(content_length) = media.content_length {
-            builder = builder.header("X-Upload-Content-Length", content_length.to_string());
-        }
-
-        builder
-    }
-
-    pub async fn start_resumable_upload(
-        &self,
-        bucket: &str,
-        object_name: &str,
-        content_length: Option<u64>,
-    ) -> Result<String, Error> {
-        let media = Media {
-            name: Cow::Owned(object_name.to_string()),
-            content_type: "application/octet-stream".into(),
-            content_length,
-        };
-
-        let reqwest_client = reqwest::Client::new();
-
-        let request = self.build_resumable_session_simple(
-            "https://storage.googleapis.com",
-            &reqwest_client,
-            &UploadObjectRequest {
-                bucket: bucket.to_string(),
-                ..Default::default()
-            },
-            &media,
-        );
-
-        let response = request
-            .send()
+                match result {
+                    Ok(response) => {
+                        let object_metadata = response.into_inner();
+                        if self.consider_expired_after_s != 0 {
+                            if let Some(last_modified) = object_metadata.update_time {
+                                let now_s = (self.now_fn)().unix_timestamp() as i64;
+                                if last_modified.seconds + self.consider_expired_after_s <= now_s {
+                                    return Some((RetryResult::Ok(None), state));
+                                }
+                            }
+                        }
+                        let length = object_metadata.size;
+                        Some((RetryResult::Ok(Some(length as u64)), state))
+                    }
+                    Err(status) => match status.code() {
+                        tonic::Code::NotFound => Some((RetryResult::Ok(None), state)),
+                        _ => Some((
+                            RetryResult::Retry(make_err!(
+                                Code::Unavailable,
+                                "Unhandled ReadObject error: {status:?}"
+                            )),
+                            state,
+                        )),
+                    },
+                }
+            }))
             .await
-            .map_err(|e| make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}"))?;
-
-        if let Some(location) = response.headers().get(LOCATION) {
-            let session_url = location
-                .to_str()
-                .map_err(|_| make_err!(Code::Unavailable, "Invalid session URL"))?
-                .to_string();
-
-            let _reqwest_client = ReqwestClient::builder()
-                .build()
-                .expect("Failed to create reqwest client");
-
-            return Ok(session_url);
-        } else {
-            Err(make_err!(
-                Code::Unavailable,
-                "No Location header in response"
-            ))
-        }
     }
 }
 
-#[async_trait]
-impl StoreDriver for GCSStore {
+// #[async_trait]
+impl<I, NowFn> StoreDriver for GCSStore<NowFn>
+where
+    I: InstantWrapper,
+    NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
+{
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
-        if keys.len() != results.len() {
-            return Err(make_err!(
-                Code::InvalidArgument,
-                "Mismatched lengths: keys = {}, results = {}",
-                keys.len(),
-                results.len()
-            ));
-        }
-
-        let fetches = keys
-            .iter()
-            .map(|key| {
-                let object_name = self.make_gcs_path(key);
-                let bucket = self.bucket.clone();
-                let client = self.gcs_client.clone();
-
-                async move {
-                    let req = GetObjectRequest {
-                        bucket,
-                        object: object_name,
-                        ..Default::default()
-                    };
-
-                    match client.get_object(&req).await {
-                        Ok(metadata) => match metadata.size.try_into() {
-                            Ok(size) => Ok(Some(size)),
-                            Err(_) => Err(make_err!(
-                                Code::Internal,
-                                "Invalid object size: {}",
-                                metadata.size
-                            )),
-                        },
-                        Err(e) => {
-                            if e.to_string().contains("404") {
-                                Ok(None)
-                            } else {
-                                Err(make_err!(
-                                    Code::Unavailable,
-                                    "Failed to check existence of object: {e:?}"
-                                ))
-                            }
-                        }
-                    }
+        keys.iter()
+            .zip(results.iter_mut())
+            .map(|(key, result)| async move {
+                // Check for zero digest as a special case.
+                if is_zero_digest(key.borrow()) {
+                    *result = Some(0);
+                    return Ok::<_, Error>(());
                 }
+                *result = self.has(key).await?;
+                Ok::<_, Error>(())
             })
-            .collect::<FuturesUnordered<_>>();
-
-        for (result, fetch_result) in results.iter_mut().zip(fetches.collect::<Vec<_>>().await) {
-            *result = fetch_result?;
-        }
-
-        Ok(())
+            .collect::<FuturesUnordered<_>>()
+            .try_collect()
+            .await
     }
 
-    /// Updates a file in GCS using resumable uploads.
-    ///
-    /// GCS Resumable Uploads Note:
-    /// Resumable upload sessions in GCS do not require explicit abort calls for cleanup.
-    /// GCS automatically deletes incomplete sessions after a configurable period (default: 1 week).
-    /// Reference: https://cloud.google.com/storage/docs/resumable-uploads
     async fn update(
         self: Pin<&Self>,
-        key: StoreKey<'_>,
+        digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
-        let object_name = Arc::new(self.make_gcs_path(&key));
+        let gcs_path = self.make_gcs_path(&digest.borrow());
 
-        let file_size = match upload_size {
-            UploadSizeInfo::ExactSize(size) => size,
-            _ => return Err(make_err!(Code::InvalidArgument, "Unknown file size")),
-        } as usize;
+        let max_size = match upload_size {
+            UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
+        };
 
-        debug!("Starting upload to GCS for object: {}", object_name);
+        // If size is below chunk threshold and is known, use a simple upload
+        // Single-chunk upload for small files
+        if max_size < DEFAULT_CHUNK_SIZE && matches!(upload_size, UploadSizeInfo::ExactSize(_)) {
+            let UploadSizeInfo::ExactSize(sz) = upload_size else {
+                unreachable!("upload_size must be UploadSizeInfo::ExactSize here");
+            };
+            reader.set_max_recent_data_size(
+                u64::try_from(self.max_retry_buffer_per_request)
+                    .err_tip(|| "Could not convert max_retry_buffer_per_request to u64")?,
+            );
 
-        let session_url = self
-            .start_resumable_upload(&self.bucket, &object_name, Some(file_size as u64))
-            .await
-            .map_err(|e| make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}"))?;
+            // Read all data and upload in one request
+            let data = reader
+                .consume(Some(sz as usize))
+                .await
+                .err_tip(|| "Failed to read data for single upload")?;
 
-        let reqwest_client = ReqwestClient::builder()
-            .build()
-            .expect("Failed to create reqwest client");
+            return self
+                .retrier
+                .retry(unfold((), move |()| async move {
+                    let write_spec = WriteObjectSpec {
+                        resource: Some(Object {
+                            name: gcs_path.clone(),
+                            ..Default::default()
+                        }),
+                        object_size: Some(sz as i64),
+                        ..Default::default()
+                    };
 
-        let client_with_middleware =
-            ClientWithMiddleware::new(reqwest_client, Vec::<Arc<dyn Middleware>>::new());
+                    let request = WriteObjectRequest {
+                        first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
+                            write_spec,
+                        )),
+                        data: Some(write_object_request::Data::ChecksummedData(
+                            ChecksummedData {
+                                content: data.clone(),
+                                crc32c: Some(crc32c::crc32c(&data)),
+                            },
+                        )),
+                        finish_write: true,
+                        ..Default::default()
+                    };
 
-        let resumable_client = ResumableUploadClient::new(session_url, client_with_middleware);
+                    let result = self
+                        .gcs_client
+                        .write_object(request)
+                        .await
+                        .map_err(|e| make_err!(Code::Aborted, "WriteObject failed: {e:?}"));
 
-        let reader = Arc::new(Mutex::new(reader));
-        let (tx, _) = tokio::sync::broadcast::channel::<Result<bytes::Bytes, Error>>(10);
-
-        // Spawn a task to read data and broadcast it
-        {
-            let reader_clone = Arc::clone(&reader);
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let buffer = vec![0u8; CHUNK_BUFFER_SIZE];
-                let mut reader = reader_clone.lock().await;
-
-                loop {
-                    match reader.consume(Some(buffer.len())).await {
-                        Ok(bytes) => {
-                            if bytes.is_empty() {
-                                break; // EOF
-                            }
-                            if tx.send(Ok(bytes.into())).is_err() {
-                                break; // No active receivers
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(make_err!(Code::Unavailable, "Read error: {e:?}")));
-                            break;
-                        }
+                    match result {
+                        Ok(_) => Some((RetryResult::Ok(()), reader)),
+                        Err(e) => Some((RetryResult::Retry(e), reader)),
                     }
-                }
-            });
+                }))
+                .await;
         }
 
-        async fn retry_upload(
-            tx: &tokio::sync::broadcast::Sender<Result<bytes::Bytes, Error>>,
-            resumable_client: &ResumableUploadClient,
-            object_name: Arc<String>,
-            file_size: usize,
-        ) -> Result<(), Error> {
-            let rx = tx.subscribe();
+        // Start a resumable write session for larger files
+        let upload_id = self
+            .retrier
+            .retry(unfold((), move |()| async move {
+                let write_spec = WriteObjectSpec {
+                    resource: Some(Object {
+                        name: gcs_path.clone(),
+                        ..Default::default()
+                    }),
+                    object_size: Some(max_size as i64),
+                    ..Default::default()
+                };
 
-            let body = Body::wrap_stream(BroadcastStream::new(rx).map(|res| {
-                res.map_err(|e| {
-                    debug!("Stream error: {:?}", e);
-                    std::io::Error::new(std::io::ErrorKind::Other, "Stream failed")
-                })
-                .unwrap_or_else(|_| Ok(bytes::Bytes::new()))
-            }));
+                let request = StartResumableWriteRequest {
+                    write_object_spec: Some(write_spec),
+                    ..Default::default()
+                };
 
-            match resumable_client.status(None).await? {
-                UploadStatus::NotStarted => {
-                    resumable_client
-                        .upload_single_chunk(body, file_size)
-                        .await
-                        .map_err(|e| {
-                            make_err!(Code::Unavailable, "Single chunk upload failed: {e:?}")
-                        })?;
-                }
-                UploadStatus::ResumeIncomplete(range) => {
-                    let total_size = file_size as u64;
-                    let mut current_position = range.last_byte + 1;
+                let result = self
+                    .gcs_client
+                    .start_resumable_write(request)
+                    .await
+                    .map_err(|e| {
+                        make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}")
+                    });
 
-                    while current_position < total_size {
-                        let chunk_size = ChunkSize::new(
-                            current_position,
-                            (current_position + DEFAULT_CHUNK_SIZE as u64 - 1).min(total_size - 1),
-                            Some(total_size),
-                        );
-
-                        debug!(
-                            "Uploading chunk: {:?} for object: {}",
-                            chunk_size, object_name
-                        );
-
-                        let rx = tx.subscribe();
-
-                        let chunk_body = Body::wrap_stream(BroadcastStream::new(rx).map(|res| {
-                            res.map_err(|e| {
-                                debug!("Stream error: {:?}", e);
-                                std::io::Error::new(std::io::ErrorKind::Other, "Stream failed")
-                            })
-                            .unwrap_or_else(|_| Ok(bytes::Bytes::new()))
-                        }));
-
-                        resumable_client
-                            .upload_multiple_chunk(chunk_body, &chunk_size)
-                            .await
-                            .map_err(|e| {
-                                make_err!(Code::Unavailable, "Chunk upload failed: {e:?}")
-                            })?;
-
-                        current_position += chunk_size.size();
-                    }
-                }
-                UploadStatus::Ok(_) => {
-                    debug!("Upload completed!");
-                }
-            }
-            Ok::<(), Error>(())
-        }
-
-        self.retrier
-            .retry(unfold(tx.clone(), {
-                let resumable_client = resumable_client.clone();
-                let object_name_clone = Arc::clone(&object_name);
-                let reader = Arc::clone(&reader);
-
-                move |tx| {
-                    let resumable_client = resumable_client.clone();
-                    let object_name = Arc::clone(&object_name_clone);
-                    let reader = Arc::clone(&reader);
-
-                    async move {
-                        let retry_result = match retry_upload(
-                            &tx,
-                            &resumable_client,
-                            Arc::clone(&object_name),
-                            file_size,
-                        )
-                        .await
-                        {
-                            Ok(_) => RetryResult::Ok(()),
-                            Err(e) => {
-                                let mut reader = reader.lock().await;
-                                if let Err(reset_err) = reader.try_reset_stream() {
-                                    RetryResult::Err(make_err!(
-                                        Code::Unavailable,
-                                        "Failed to reset stream for retry: {reset_err:?} {e:?}"
-                                    ))
-                                } else {
-                                    RetryResult::Retry(e)
-                                }
-                            }
-                        };
-
-                        Some((retry_result, tx))
-                    }
+                match result {
+                    Ok(response) => Some((RetryResult::Ok(response.into_inner().upload_id), ())),
+                    Err(e) => Some((RetryResult::Retry(e), ())),
                 }
             }))
             .await?;
 
-        debug!("Upload completed for object: {}", object_name);
+        // Chunked upload loop
+        let mut offset = 0;
+        let mut chunk_size = self.resumable_chunk_size;
+
+        while offset < max_size {
+            let data = reader
+                .consume(Some(chunk_size))
+                .await
+                .err_tip(|| "Failed to read data for chunked upload")?;
+
+            let is_last_chunk = offset + chunk_size >= max_size;
+
+            self.retrier
+                .retry(unfold(data, move |data| async move {
+                    let request = WriteObjectRequest {
+                        upload_id: Some(upload_id.clone()),
+                        write_offset: offset as i64,
+                        finish_write: is_last_chunk,
+                        data: Some(write_object_request::Data::ChecksummedData(
+                            ChecksummedData {
+                                content: data.clone(),
+                                crc32c: Some(crc32c::crc32c(&data)),
+                            },
+                        )),
+                        ..Default::default()
+                    };
+
+                    let result = self
+                        .gcs_client
+                        .write_object(request)
+                        .await
+                        .map_err(|e| make_err!(Code::Aborted, "Failed to upload chunk: {e:?}"));
+
+                    match result {
+                        Ok(_) => Some((RetryResult::Ok(()), data)),
+                        Err(e) => Some((RetryResult::Retry(e), data)),
+                    }
+                }))
+                .await?;
+
+            offset += chunk_size;
+        }
+        // Finalize the upload
+        self.retrier
+            .retry(unfold((), move |()| async move {
+                let request = QueryWriteStatusRequest {
+                    upload_id: upload_id.clone(),
+                    ..Default::default()
+                };
+
+                let result = self
+                    .gcs_client
+                    .query_write_status(request)
+                    .await
+                    .map_err(|e| make_err!(Code::Unavailable, "Failed to finalize upload: {e:?}"));
+
+                match result {
+                    Ok(_) => Some((RetryResult::Ok(()), ())),
+                    Err(e) => Some((RetryResult::Retry(e), ())),
+                }
+            }))
+            .await?;
         Ok(())
     }
 
@@ -485,52 +398,94 @@ impl StoreDriver for GCSStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        let object_name = self.make_gcs_path(&key);
+        if is_zero_digest(key.borrow()) {
+            writer
+                .send_eof()
+                .err_tip(|| "Failed to send zero EOF in GCS store get_part")?;
+            return Ok(());
+        }
 
-        let req = GetObjectRequest {
-            bucket: self.bucket.clone(),
-            object: object_name.clone(),
-            ..Default::default()
-        };
-
-        let range = Range(Some(offset), length.map(|len| offset + len));
+        let gcs_path = self.make_gcs_path(&key);
 
         self.retrier
-            .retry(stream::once(async {
-                let result = async {
-                    let mut stream = self
-                        .gcs_client
-                        .download_streamed_object(&req, &range)
-                        .await
-                        .map_err(|e| {
-                            make_err!(Code::Unavailable, "Failed to initiate download: {e:?}")
-                        })?;
+            .retry(unfold(writer, move |writer| async move {
+                let request = ReadObjectRequest {
+                    bucket: self.bucket.clone(),
+                    object: gcs_path.clone(),
+                    read_offset: offset as i64,
+                    read_limit: length.map(|l| l as i64),
+                    ..Default::default()
+                };
 
-                    while let Some(chunk) = stream.next().await {
-                        let chunk = chunk.map_err(|e| {
-                            make_err!(Code::Unavailable, "Failed to download chunk: {e:?}")
-                        })?;
-                        writer
-                            .send(chunk)
-                            .await
-                            .map_err(|e| make_err!(Code::Unavailable, "Write error: {e:?}"))?;
+                let result = self.gcs_client.read_object(request).await;
+
+                let mut response_stream = match result {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::NotFound => {
+                        return Some((
+                            RetryResult::Err(make_err!(
+                                Code::NotFound,
+                                "GCS object not found: {gcs_path}"
+                            )),
+                            writer,
+                        ));
                     }
+                    Err(e) => {
+                        return Some((
+                            RetryResult::Retry(make_err!(
+                                Code::Unavailable,
+                                "Failed to initiate read for GCS object: {e:?}"
+                            )),
+                            writer,
+                        ));
+                    }
+                };
 
-                    writer
-                        .send_eof()
-                        .map_err(|e| make_err!(Code::Internal, "EOF error: {e:?}"))?;
-                    Ok::<(), Error>(())
+                // Stream data from the GCS response to the writer
+                while let Some(chunk) = response_stream.next().await {
+                    match chunk {
+                        Ok(data) => {
+                            if let Some(content) = data.content {
+                                if content.is_empty() {
+                                    // Ignore empty chunks
+                                    continue;
+                                }
+                                if let Err(e) = writer.send(content).await {
+                                    return Some((
+                                        RetryResult::Err(make_err!(
+                                            Code::Aborted,
+                                            "Failed to send bytes to writer in GCS: {e:?}"
+                                        )),
+                                        writer,
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Some((
+                                RetryResult::Retry(make_err!(
+                                    Code::Aborted,
+                                    "Error in GCS response stream: {e:?}"
+                                )),
+                                writer,
+                            ));
+                        }
+                    }
                 }
-                .await;
 
-                match result {
-                    Ok(_) => RetryResult::Ok(()),
-                    Err(e) => RetryResult::Retry(e),
+                if let Err(e) = writer.send_eof() {
+                    return Some((
+                        RetryResult::Err(make_err!(
+                            Code::Aborted,
+                            "Failed to send EOF to writer in GCS: {e:?}"
+                        )),
+                        writer,
+                    ));
                 }
+
+                Some((RetryResult::Ok(()), writer))
             }))
-            .await?;
-
-        Ok(())
+            .await
     }
 
     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {

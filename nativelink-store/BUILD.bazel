@@ -56,6 +56,7 @@ rust_library(
         "@crates//:filetime",
         "@crates//:fred",
         "@crates//:futures",
+        "@crates//:googleapis-tonic-google-storage-v2",
         "@crates//:hex",
         "@crates//:http-body",
         "@crates//:hyper-0.14.31",
