@@ -312,7 +312,6 @@ where
             .retry(unfold((), move |()| {
                 let mut client = (*client).clone();
                 let gcs_path = gcs_path.clone();
-                let upload_id = upload_id.clone();
                 async move {
                     let write_spec = WriteObjectSpec {
                         resource: Some(Object {
