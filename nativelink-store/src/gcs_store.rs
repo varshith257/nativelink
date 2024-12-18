@@ -37,7 +37,6 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rand::rngs::OsRng;
 use rand::Rng;
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
@@ -152,6 +151,7 @@ where
     /// Check if the object exists and is not expired
     pub async fn has(self: Pin<&Self>, digest: &StoreKey<'_>) -> Result<Option<u64>, Error> {
         let client = Arc::clone(&self.gcs_client);
+        let cloned_client = (*client).clone();
         self.retrier
             .retry(unfold((), move |state| async move {
                 let object_path = self.make_gcs_path(digest);
@@ -161,7 +161,7 @@ where
                     ..Default::default()
                 };
 
-                let result = client.read_object(request).await;
+                let result = cloned_client.read_object(request).await;
 
                 match result {
                     Ok(response) => {
@@ -291,8 +291,8 @@ where
                         .map_err(|e| make_err!(Code::Aborted, "WriteObject failed: {e:?}"));
 
                     match result {
-                        Ok(_) => Some((RetryResult::Ok(()), reader)),
-                        Err(e) => Some((RetryResult::Retry(e), reader)),
+                        Ok(_) => Some((RetryResult::Ok(()), ())),
+                        Err(e) => Some((RetryResult::Retry(e), ())),
                     }
                 }))
                 .await;
@@ -413,7 +413,6 @@ where
         }
 
         let gcs_path = self.make_gcs_path(&key);
-        let client = Arc::clone(&self.gcs_client);
 
         self.retrier
             .retry(unfold(writer, move |writer| {
@@ -427,7 +426,10 @@ where
                         ..Default::default()
                     };
 
-                    let result = client.read_object(request).await;
+                    let client = Arc::clone(&self.gcs_client);
+                    let cloned_client = (*client).clone();
+
+                    let result = cloned_client.read_object(request).await;
 
                     let mut response_stream = match result {
                         Ok(response) => response.into_inner(),
@@ -435,7 +437,7 @@ where
                             return Some((
                                 RetryResult::Err(make_err!(
                                     Code::NotFound,
-                                    "GCS object not found: {gcs_path}"
+                                    "GCS object not found: {path}"
                                 )),
                                 writer,
                             ));
