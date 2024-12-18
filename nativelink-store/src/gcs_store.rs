@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crc32c::crc32c;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
@@ -63,12 +62,9 @@ These differences emphasize the need for tailored approaches to storage backends
 ---
 */
 
+// Default Buffer size for reading chunks of data in bytes.
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
-
-// Buffer size for reading chunks of data in bytes.
-// Note: If you change this, adjust the docs in the config.
-const CHUNK_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
@@ -132,7 +128,7 @@ where
                 jitter_fn,
                 spec.retry.clone(),
             ),
-            consider_expired_after_s: spec.consider_expired_after_s as i64,
+            consider_expired_after_s: i64::from(spec.consider_expired_after_s),
             max_retry_buffer_per_request: spec
                 .max_retry_buffer_per_request
                 .unwrap_or(DEFAULT_CHUNK_SIZE as usize),
