@@ -778,7 +778,7 @@ pub struct GCSSpec {
 
     /// Optional configuration for client authentication.
     /// Example: Path to a service account JSON key file or environment-based authentication.
-    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    #[serde(default)]
     pub auth_key_file: Option<String>,
 }
 

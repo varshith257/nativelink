@@ -63,7 +63,7 @@ use crate::cas_utils::is_zero_digest;
 
 ### **Rationale for Implementation Differences**
 
-The GCS store implementation adheres to the requirements and limitations of Google Cloud Storage's gRPC API. 
+The GCS store implementation adheres to the requirements and limitations of Google Cloud Storage's gRPC API.
 Sequential chunk uploads, explicit session handling and checksum validation reflect the service's design.
 In contrast, S3's multipart upload API simplifies concurrency, error handling, and session management.
 
@@ -197,7 +197,7 @@ where
     }
 }
 
-// #[async_trait]
+#[async_trait]
 impl<I, NowFn> StoreDriver for GCSStore<NowFn>
 where
     I: InstantWrapper,
