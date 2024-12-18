@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crc32c::crc32c;
 use futures::stream;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
@@ -76,7 +75,7 @@ const CHUNK_BUFFER_SIZE: usize = 64 * 1024;
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
-    gcs_client: StorageClient<Channel>,
+    gcs_client: Arc<StorageClient<Channel>>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
@@ -271,7 +270,7 @@ where
                         ..Default::default()
                     };
 
-                    let request_stream = stream::iter(vec![Ok(WriteObjectRequest {
+                    let request_stream = stream::iter(vec![WriteObjectRequest {
                         first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
                             write_spec,
                         )),
@@ -283,7 +282,7 @@ where
                         )),
                         finish_write: true,
                         ..Default::default()
-                    })]);
+                    }]);
 
                     let result = self
                         .gcs_client
@@ -346,7 +345,7 @@ where
 
             self.retrier
                 .retry(unfold(data, move |data| async move {
-                    let request_stream = stream::iter(vec![Ok(WriteObjectRequest {
+                    let request_stream = stream::iter(vec![WriteObjectRequest {
                         first_message: Some(write_object_request::FirstMessage::UploadId(
                             upload_id.clone(),
                         )),
@@ -359,7 +358,7 @@ where
                             },
                         )),
                         ..Default::default()
-                    })]);
+                    }]);
 
                     let result = self
                         .gcs_client
