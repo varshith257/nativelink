@@ -49,29 +49,6 @@ crate.from_cargo(
 )
 use_repo(crate, "crates")
 
-# Use crate.annotation to override features
-crate.annotation(
-    name = "azure_core_override",
-    crate = "@crates//:azure_core",
-    features = ["xml", "hmac_rust"],
-    default_features = False,
-)
-
-crate.annotation(
-    name = "azure_storage_override",
-    crate = "@crates//:azure_storage",
-    features = ["hmac_rust"],
-    default_features = False,
-)
-
-crate.annotation(
-    name = "azure_storage_blobs_override",
-    crate = "@crates//:azure_storage_blobs",
-    features = ["hmac_rust"],
-    default_features = False,
-)
-
-
 # NativeLink uses Local Remote Execution for Rust by default which automatically
 # handles Rust toolchain configuration via Nix.
 #
