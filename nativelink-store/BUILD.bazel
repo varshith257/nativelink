@@ -133,7 +133,7 @@ rust_test_suite(
         "@crates//:uuid",
         "@crates//:azure_core",
         "@crates//:azure_storage",
-        "@crates//:azure_storage-blobs",
+        "@crates//:azure_storage_blobs",
     ],
     features = {
         "@crates//:azure_core": [
