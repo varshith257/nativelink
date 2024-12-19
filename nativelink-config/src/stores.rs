@@ -78,6 +78,10 @@ pub enum StoreSpec {
     ///
     experimental_s3_store(S3Spec),
 
+    // TODO: add docs
+    experimental_azure_store(AzureSpec),
+
+
     /// Verify store is used to apply verifications to an underlying
     /// store implementation. It is strongly encouraged to validate
     /// as much data as you can before accepting data from a client,
@@ -723,6 +727,54 @@ pub struct EvictionPolicy {
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_count: u64,
 }
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AzureSpec {
+    /// The Azure storage account name for explicit authentication.
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub account_name: Option<String>,
+
+    /// The Azure storage account key for explicit authentication.
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub account_key: Option<String>,
+
+    /// Shared Access Signature (SAS) token for secure access.
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub sas_token: Option<String>,
+
+    /// Azure container name to store the data.
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub container_name: String,
+
+    /// Retry configuration for failed operations.
+    #[serde(default)]
+    pub retry: Retry,
+
+    /// The maximum buffer size for retrying uploads.
+    pub max_retry_buffer_per_request: Option<usize>,
+
+    /// Maximum number of concurrent uploads for large blob uploads.
+    pub max_concurrent_uploads: Option<usize>,
+
+    /// The number of seconds to consider an object expired.
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    pub consider_expired_after_s: u32,
+
+    /// Allow unencrypted HTTP connections (for testing only).
+    #[serde(default)]
+    pub insecure_allow_http: bool,
+
+    /// Disable HTTP/2 connections and enforce HTTP/1.1.
+    #[serde(default)]
+    pub disable_http2: bool,
+
+    /// If you wish to prefix the location in the Azure container. If None, no prefix will be used.
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+
+}
+
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(deny_unknown_fields)]
