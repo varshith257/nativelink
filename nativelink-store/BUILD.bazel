@@ -46,6 +46,9 @@ rust_library(
         "@crates//:aws-config",
         "@crates//:aws-sdk-s3",
         "@crates//:aws-smithy-runtime",
+        "@crates//:azure_core",
+        "@crates//:azure_storage",
+        "@crates//:azure_storage_blobs",
         "@crates//:bincode",
         "@crates//:blake3",
         "@crates//:byteorder",
@@ -71,9 +74,6 @@ rust_library(
         "@crates//:tonic",
         "@crates//:tracing",
         "@crates//:uuid",
-        "@crates//:azure_core",
-        "@crates//:azure_storage",
-        "@crates//:azure_storage_blobs",
     ],
 )
 
