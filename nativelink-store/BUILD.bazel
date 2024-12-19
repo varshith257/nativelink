@@ -71,7 +71,22 @@ rust_library(
         "@crates//:tonic",
         "@crates//:tracing",
         "@crates//:uuid",
+        "@crates//:azure_core",
+        "@crates//:azure_storage",
+        "@crates//:azure_storage_blobs",
     ],
+    features = {
+        "@crates//:azure_core": [
+            "xml",
+            "hmac_rust"
+        ],
+        "@crates//:azure_storage": [
+            "hmac_rust"
+        ],
+        "@crates//:azure_storage_blobs": [
+            "hmac_rust"
+        ],
+    },
 )
 
 rust_test_suite(
@@ -131,22 +146,7 @@ rust_test_suite(
         "@crates//:tracing",
         "@crates//:tracing-subscriber",
         "@crates//:uuid",
-        "@crates//:azure_core",
-        "@crates//:azure_storage",
-        "@crates//:azure_storage_blobs",
     ],
-    features = {
-        "@crates//:azure_core": [
-            "xml",
-            "hmac_rust"
-        ],
-        "@crates//:azure_storage": [
-            "hmac_rust"
-        ],
-        "@crates//:azure_storage_blobs": [
-            "hmac_rust"
-        ],
-    },
 )
 
 rust_doc(
