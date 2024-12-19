@@ -49,22 +49,22 @@ crate.from_cargo(
 )
 use_repo(crate, "crates")
 
-# Use crate.annotate to override features
-crate.annotate(
+# Use crate.annotation to override features
+crate.annotation(
     name = "azure_core_override",
     crate = "@crates//:azure_core",
     features = ["xml", "hmac_rust"],
     default_features = False,
 )
 
-crate.annotate(
+crate.annotation(
     name = "azure_storage_override",
     crate = "@crates//:azure_storage",
     features = ["hmac_rust"],
     default_features = False,
 )
 
-crate.annotate(
+crate.annotation(
     name = "azure_storage_blobs_override",
     crate = "@crates//:azure_storage_blobs",
     features = ["hmac_rust"],
