@@ -45,24 +45,32 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
     ],
-    overrides = {
-        "azure_core": {
-            "features": ["xml", "hmac_rust"],
-            "default_features": False,  # Disable default features to exclude reqwest
-        },
-        # Override features for azure_storage
-        "azure_storage": {
-            "features": ["hmac_rust"],
-            "default_features": False,
-        },
-        # Override features for azure_storage_blobs
-        "azure_storage_blobs": {
-            "features": ["hmac_rust"],
-            "default_features": False,
-        },
-    },
+
 )
 use_repo(crate, "crates")
+
+# Use crate.annotate to override features
+crate.annotate(
+    name = "azure_core_override",
+    crate = "@crates//:azure_core",
+    features = ["xml", "hmac_rust"],
+    default_features = False,
+)
+
+crate.annotate(
+    name = "azure_storage_override",
+    crate = "@crates//:azure_storage",
+    features = ["hmac_rust"],
+    default_features = False,
+)
+
+crate.annotate(
+    name = "azure_storage_blobs_override",
+    crate = "@crates//:azure_storage_blobs",
+    features = ["hmac_rust"],
+    default_features = False,
+)
+
 
 # NativeLink uses Local Remote Execution for Rust by default which automatically
 # handles Rust toolchain configuration via Nix.
