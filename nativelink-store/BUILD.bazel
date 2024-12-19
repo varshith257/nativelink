@@ -131,7 +131,16 @@ rust_test_suite(
         "@crates//:tracing",
         "@crates//:tracing-subscriber",
         "@crates//:uuid",
+        "@crates//:azure-core",
+        "@crates//:azure-storage",
+        "@crates//:azure-storage-blobs",
     ],
+    features = {
+        "@crates//:azure-core": [
+            "disable_reqwest",
+            "stream",
+        ],
+    },
 )
 
 rust_doc(
