@@ -75,18 +75,6 @@ rust_library(
         "@crates//:azure_storage",
         "@crates//:azure_storage_blobs",
     ],
-    features = {
-        "@crates//:azure_core": [
-            "xml",
-            "hmac_rust"
-        ],
-        "@crates//:azure_storage": [
-            "hmac_rust"
-        ],
-        "@crates//:azure_storage_blobs": [
-            "hmac_rust"
-        ],
-    },
 )
 
 rust_test_suite(

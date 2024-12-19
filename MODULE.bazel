@@ -45,6 +45,22 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
     ],
+    overrides = {
+        "azure_core": {
+            "features": ["xml", "hmac_rust"],
+            "default_features": False,  # Disable default features to exclude reqwest
+        },
+        # Override features for azure_storage
+        "azure_storage": {
+            "features": ["hmac_rust"],
+            "default_features": False,
+        },
+        # Override features for azure_storage_blobs
+        "azure_storage_blobs": {
+            "features": ["hmac_rust"],
+            "default_features": False,
+        },
+    },
 )
 use_repo(crate, "crates")
 
