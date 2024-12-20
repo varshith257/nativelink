@@ -39,8 +39,7 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
-use tonic::service::Interceptor;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::{Request, Status};
 
 // use tracing::{event, Level};
@@ -97,22 +96,22 @@ impl CredentialProvider {
         Ok(lock.0.clone())
     }
 
-    /// Starts a background task to refresh the token periodically.
-    /// This ensures the token remains valid for ongoing operations.
-    pub async fn start_token_refresh(self: Arc<Self>) {
-        tokio::spawn(async move {
-            loop {
-                {
-                    let mut lock = self.token.lock().await;
-                    lock.0 = Self::fetch_gcs_token()
-                        .await
-                        .unwrap_or_else(|_| "".to_string());
-                    lock.1 = Instant::now() + Duration::from_secs(3600);
-                }
-                sleep(Duration::from_secs(3500)).await; // Refresh before expiry
-            }
-        });
-    }
+    // /// Starts a background task to refresh the token periodically.
+    // /// This ensures the token remains valid for ongoing operations.
+    // pub async fn start_token_refresh(self: Arc<Self>) {
+    //     nativelink_util::background_spawn(async move {
+    //         loop {
+    //             {
+    //                 let mut lock = self.token.lock().await;
+    //                 lock.0 = Self::fetch_gcs_token()
+    //                     .await
+    //                     .unwrap_or_else(|_| String::new());
+    //                 lock.1 = Instant::now() + Duration::from_secs(3600);
+    //             }
+    //             sleep(Duration::from_secs(3500)).await; // Refresh before expiry
+    //         }
+    //     });
+    // }
 
     pub fn get_token_sync(&self) -> String {
         // Returns the current token synchronously
@@ -222,7 +221,8 @@ where
             .get_token()
             .await
             .map_err(|_| Status::unauthenticated("Failed to retrieve auth token"))?;
-        let auth_header = format!("Bearer {}", token);
+
+        let auth_header = format!("Bearer {token}");
         request.metadata_mut().insert(
             "authorization",
             MetadataValue::try_from(auth_header).unwrap(),
@@ -246,17 +246,13 @@ where
                         ..Default::default()
                     };
 
-                    let authenticated_request = match self
-                        .inject_auth(Request::new(raw_request))
-                        .await
-                    {
-                        Ok(request) => request,
-                        Err(_) => {
-                            return Some((
-                                RetryResult::Err(make_err!(Code::Unauthenticated, "Auth failed")),
-                                state,
-                            ))
-                        }
+                    let Ok(authenticated_request) =
+                        self.inject_auth(Request::new(raw_request)).await
+                    else {
+                        return Some((
+                            RetryResult::Err(make_err!(Code::Unauthenticated, "Auth failed")),
+                            state,
+                        ));
                     };
 
                     let result = client.read_object(authenticated_request).await;
