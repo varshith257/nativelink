@@ -122,7 +122,9 @@ impl CredentialProvider {
     /// Fetches a GCS token using either an environment variable or the `gcloud` CLI.
     async fn fetch_gcs_token() -> Result<String, Error> {
         if let Ok(token) = env::var("GCS_AUTH_TOKEN") {
-            return Ok(token.trim().to_string());
+            Ok(token.trim().to_string());
+        } else {
+            Err(make_err!(Code::Unavailable, "GCS_AUTH_TOKEN not found"))
         }
     }
 }
@@ -178,7 +180,7 @@ where
         Self::new_with_client_and_jitter(spec, channel, credential_provider, jitter_fn, now_fn)
     }
 
-    pub async fn new_with_client_and_jitter(
+    pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
         channel: Channel,
         credential_provider: Arc<CredentialProvider>,
@@ -214,8 +216,7 @@ where
     }
 
     async fn inject_auth<F>(&self, mut request: Request<F>) -> Result<Request<F>, Status> {
-        let token = self
-            .credential_provider
+        let token = Arc::clone(&self.credential_provider)
             .get_token()
             .await
             .map_err(|_| Status::unauthenticated("Failed to retrieve auth token"))?;
@@ -243,8 +244,18 @@ where
                         ..Default::default()
                     };
 
-                    let mut authenticated_request =
-                        self.inject_auth(Request::new(raw_request)).await?;
+                    let authenticated_request = match self
+                        .inject_auth(Request::new(raw_request))
+                        .await
+                    {
+                        Ok(request) => request,
+                        Err(_) => {
+                            return Some((
+                                RetryResult::Err(make_err!(Code::Unauthenticated, "Auth failed")),
+                                state,
+                            ))
+                        }
+                    };
 
                     let result = client.read_object(authenticated_request).await;
 
