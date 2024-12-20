@@ -168,7 +168,7 @@ impl<I, NowFn, T> GCSStore<NowFn, T>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + Sync + 'static,
     T::ResponseBody: Send + 'static,
     T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -223,7 +223,7 @@ where
         Self::new_with_client_and_jitter(spec, gcs_client, jitter_fn, now_fn)
     }
 
-    pub fn new_with_client_and_jitter<T>(
+    pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
         gcs_client: StorageClient<T>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
@@ -316,7 +316,7 @@ impl<I, NowFn, T> StoreDriver for GCSStore<NowFn, T>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + Sync + 'static,
     T::ResponseBody: Send + 'static,
     T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -657,7 +657,7 @@ impl<I, NowFn, T> HealthStatusIndicator for GCSStore<NowFn, T>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone+ Send + Sync + 'static,
     T::ResponseBody: Send + 'static,
     T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
