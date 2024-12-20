@@ -39,7 +39,6 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
 use tonic::{Request, Status};
 
 // use tracing::{event, Level};
@@ -146,7 +145,7 @@ impl CredentialProvider {
 }
 
 #[derive(MetricsComponent)]
-pub struct GCSStore<NowFn> {
+pub struct GCSStore<NowFn, T> {
     // The gRPC client for GCS
     gcs_client: Arc<StorageClient<T>>,
     now_fn: NowFn,
@@ -165,10 +164,14 @@ pub struct GCSStore<NowFn> {
     resumable_max_concurrent_uploads: usize,
 }
 
-impl<I, NowFn> GCSStore<NowFn>
+impl<I, NowFn> GCSStore<NowFn, T>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+    T::ResponseBody: Send + 'static,
+    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     /// Retrieve the GCS endpoint from an environment variable or default to Google's public endpoint.
     fn get_gcs_endpoint() -> String {
@@ -188,15 +191,16 @@ where
         });
         let endpoint = Self::get_gcs_endpoint();
 
-        let channel = tonic::transport::Channel::from_static(&endpoint)
+        let channel = tonic::transport::Channel::from_shared(endpoint)
+            .map_err(|e| make_err!(Code::InvalidArgument, "Invalid GCS endpoint: {e:?}"))?
             .connect()
             .await
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
 
         let credential_provider = Arc::new(CredentialProvider::new().await?);
-        credential_provider.start_token_refresh().await;
+        credential_provider.clone().start_token_refresh().await;
 
-        let client = StorageClient::with_interceptor(channel, {
+        let gcs_client = StorageClient::with_interceptor(channel, {
             let provider = Arc::clone(&credential_provider);
 
             move |mut req: Request<()>| {
@@ -216,7 +220,7 @@ where
 
         // let gcs_client = StorageClient::new(channel);
 
-        Self::new_with_client_and_jitter(spec, client, jitter_fn, now_fn)
+        Self::new_with_client_and_jitter(spec, gcs_client, jitter_fn, now_fn)
     }
 
     pub fn new_with_client_and_jitter<T>(
@@ -224,13 +228,7 @@ where
         gcs_client: StorageClient<T>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
-    ) -> Result<Arc<Self>, Error>
-    where
-        T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
-        T::ResponseBody: Send + 'static,
-        T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
+    ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
