@@ -56,11 +56,29 @@ const BUCKET_NAME: &str = "dummy-bucket-name";
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 const REGION: &str = "testregion";
 
+#[async_trait::async_trait]
+pub trait StorageClientTrait: Send + Sync {
+    async fn read_object(
+        &self,
+        request: Request<ReadObjectRequest>,
+    ) -> Result<Response<ReadObjectResponse>, Status>;
+}
+
+#[async_trait::async_trait]
+impl StorageClientTrait for StorageClient<Channel> {
+    async fn read_object(
+        &self,
+        request: Request<ReadObjectRequest>,
+    ) -> Result<Response<ReadObjectResponse>, Status> {
+        self.read_object(request).await
+    }
+}
+
 mock! {
     pub StorageClient {}
 
     #[async_trait::async_trait]
-    impl StorageClient for StorageClient<Channel> {
+    impl StorageClientTrait for StorageClient {
         async fn read_object(
             &self,
             request: Request<ReadObjectRequest>,
@@ -68,13 +86,17 @@ mock! {
     }
 }
 
-fn setup_mock_client(response: Result<Response<ReadObjectResponse>, Status>) -> MockStorageClient {
+fn setup_mock_client(
+    response: Result<Response<ReadObjectResponse>, Status>,
+) -> Arc<MockStorageClient> {
     let mut mock_client = MockStorageClient::new();
     mock_client.expect_read_object().return_once(|_| response);
-    mock_client
+    Arc::new(mock_client)
 }
 
-async fn create_gcs_store(mock_client: MockStorageClient) -> Arc<GCSStore<MockInstantWrapped>> {
+async fn create_gcs_store(
+    mock_client: Arc<dyn StorageClientTrait>,
+) -> Arc<GCSStore<MockInstantWrapped>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 
     GCSStore::new_with_client_and_jitter(
@@ -82,7 +104,7 @@ async fn create_gcs_store(mock_client: MockStorageClient) -> Arc<GCSStore<MockIn
             bucket: BUCKET_NAME.to_string(),
             ..Default::default()
         },
-        Arc::new(mock_client),
+        mock_client,
         credential_provider,
         Arc::new(move |_delay| Duration::from_secs(0)),
         MockInstantWrapped::default,
@@ -100,7 +122,7 @@ async fn test_has_object_found() -> Result<(), Error> {
         ..Default::default()
     })));
 
-    let store = create_gcs_store(mock_client).await?;
+    let store = create_gcs_store(mock_client).await;
 
     let digest = DigestInfo::try_new(VALID_HASH1, 100).unwrap();
     let result = store.has(&digest).await;
