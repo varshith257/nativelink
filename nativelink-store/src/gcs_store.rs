@@ -39,6 +39,9 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
 // use tracing::{event, Level};
@@ -123,31 +126,33 @@ impl CredentialProvider {
             return Ok(token);
         }
 
-        // Fallback to using `gcloud` CLI to retrieve the access token
-        let output = std::process::Command::new("gcloud")
-            .arg("auth")
-            .arg("print-access-token")
-            .output()
-            .map_err(|e| make_err!(Code::Unavailable, "Failed to execute gcloud command: {e:?}"))?;
-
-        if !output.status.success() {
-            return Err(make_err!(
-                Code::Unauthenticated,
-                "Failed to retrieve token via gcloud: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
         let token = String::from_utf8(output.stdout)
             .map_err(|e| make_err!(Code::Unavailable, "Invalid UTF-8 token: {e:?}"))?;
         Ok(token.trim().to_string())
     }
 }
 
+pub struct AuthInterceptor {
+    token_provider: Arc<CredentialProvider>,
+}
+
+impl Interceptor for AuthInterceptor {
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        let token = self.token_provider.get_token_sync();
+        if token.is_empty() {
+            return Err(Status::unauthenticated("No authentication token available"));
+        }
+        let auth_header = format!("Bearer {}", token);
+        req.metadata_mut()
+            .insert("authorization", auth_header.parse().unwrap());
+        Ok(req)
+    }
+}
+
 #[derive(MetricsComponent)]
-pub struct GCSStore<NowFn, T> {
+pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
-    gcs_client: Arc<StorageClient<T>>,
+    gcs_client: Arc<StorageClient<Channel>>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
@@ -164,20 +169,11 @@ pub struct GCSStore<NowFn, T> {
     resumable_max_concurrent_uploads: usize,
 }
 
-impl<I, NowFn, T> GCSStore<NowFn, T>
+impl<I, NowFn> GCSStore<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + Sync + 'static,
-    T::ResponseBody: Send + 'static,
-    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    /// Retrieve the GCS endpoint from an environment variable or default to Google's public endpoint.
-    fn get_gcs_endpoint() -> String {
-        env::var("GCS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
-    }
-
     /// Create a GCS client with an interceptor for dynamic token injection.
     pub async fn new(spec: &GCSSpec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
         let jitter_amt = spec.retry.jitter;
@@ -198,37 +194,28 @@ where
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
 
         let credential_provider = Arc::new(CredentialProvider::new().await?);
-        credential_provider.clone().start_token_refresh().await;
-
-        let gcs_client = StorageClient::with_interceptor(channel, {
-            let provider = Arc::clone(&credential_provider);
-
-            move |mut req: Request<()>| {
-                let token = provider.get_token_sync();
-                if token.is_empty() {
-                    return Err(Status::unauthenticated("Token unavailable"));
-                }
-
-                let token_header = format!("Bearer {}", token);
-                req.metadata_mut().insert(
-                    "authorization",
-                    MetadataValue::try_from(token_header).unwrap(),
-                );
-                Ok(req)
-            }
-        });
 
         // let gcs_client = StorageClient::new(channel);
+        let interceptor = AuthInterceptor {
+            token_provider: Arc::clone(&credential_provider),
+        };
+        let gcs_client = StorageClient::with_interceptor(channel, interceptor);
 
         Self::new_with_client_and_jitter(spec, gcs_client, jitter_fn, now_fn)
     }
 
-    pub fn new_with_client_and_jitter(
+    pub fn new_with_client_and_jitter<C>(
         spec: &GCSSpec,
-        gcs_client: StorageClient<T>,
+        gcs_client: StorageClient<C>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
-    ) -> Result<Arc<Self>, Error> {
+    ) -> Result<Arc<Self>, Error>
+    where
+        C: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + Sync + 'static,
+        C::ResponseBody: Send + Sync + 'static,
+        C::Error: Into<tonic::Status> + Send + Sync + 'static,
+        C::Future: Send + 'static,
+    {
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
@@ -254,6 +241,11 @@ where
         format!("{}{}", self.key_prefix, key.as_str())
     }
 
+    /// Retrieve the GCS endpoint from an environment variable or default to Google's public endpoint.
+    fn get_gcs_endpoint() -> String {
+        env::var("GCS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
+    }
+
     /// Check if the object exists and is not expired
     pub async fn has(self: Pin<&Self>, digest: &StoreKey<'_>) -> Result<Option<u64>, Error> {
         let client = Arc::clone(&self.gcs_client);
@@ -261,6 +253,7 @@ where
         self.retrier
             .retry(unfold((), move |state| {
                 let mut client = (*client).clone();
+
                 async move {
                     let object_path = self.make_gcs_path(digest);
                     let request = ReadObjectRequest {
@@ -312,14 +305,10 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn, T> StoreDriver for GCSStore<NowFn, T>
+impl<I, NowFn> StoreDriver for GCSStore<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + Sync + 'static,
-    T::ResponseBody: Send + 'static,
-    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     async fn has_with_results(
         self: Pin<&Self>,
@@ -653,14 +642,10 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn, T> HealthStatusIndicator for GCSStore<NowFn, T>
+impl<I, NowFn> HealthStatusIndicator for GCSStore<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone+ Send + Sync + 'static,
-    T::ResponseBody: Send + 'static,
-    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     fn get_name(&self) -> &'static str {
         "GCSStore"
