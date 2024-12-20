@@ -122,26 +122,8 @@ impl CredentialProvider {
     /// Fetches a GCS token using either an environment variable or the `gcloud` CLI.
     async fn fetch_gcs_token() -> Result<String, Error> {
         if let Ok(token) = env::var("GCS_AUTH_TOKEN") {
-            return Ok(token);
+            return Ok(token.trim().to_string());
         }
-        Ok(token.trim().to_string())
-    }
-}
-
-pub struct AuthInterceptor {
-    token_provider: Arc<CredentialProvider>,
-}
-
-impl Interceptor for AuthInterceptor {
-    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
-        let token = self.token_provider.get_token_sync();
-        if token.is_empty() {
-            return Err(Status::unauthenticated("No authentication token available"));
-        }
-        let auth_header = format!("Bearer {}", token);
-        req.metadata_mut()
-            .insert("authorization", auth_header.parse().unwrap());
-        Ok(req)
     }
 }
 
@@ -163,6 +145,7 @@ pub struct GCSStore<NowFn> {
     resumable_chunk_size: usize,
     #[metric(help = "The number of concurrent uploads allowed for resumable uploads")]
     resumable_max_concurrent_uploads: usize,
+    credential_provider: Arc<CredentialProvider>,
 }
 
 impl<I, NowFn> GCSStore<NowFn>
@@ -181,8 +164,9 @@ where
             let max = 1. + (jitter_amt / 2.);
             delay.mul_f32(OsRng.gen_range(min..max))
         });
-        let endpoint = Self::get_gcs_endpoint();
 
+        let endpoint = env::var("GCS_ENDPOINT")
+            .unwrap_or_else(|_| "https://storage.googleapis.com".to_string());
         let channel = tonic::transport::Channel::from_shared(endpoint)
             .map_err(|e| make_err!(Code::InvalidArgument, "Invalid GCS endpoint: {e:?}"))?
             .connect()
@@ -194,18 +178,15 @@ where
         Self::new_with_client_and_jitter(spec, channel, credential_provider, jitter_fn, now_fn)
     }
 
-    pub fn new_with_client_and_jitter(
+    pub async fn new_with_client_and_jitter(
         spec: &GCSSpec,
         channel: Channel,
         credential_provider: Arc<CredentialProvider>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
     ) -> Result<Arc<Self>, Error> {
-        let interceptor = AuthInterceptor {
-            token_provider: Arc::clone(&credential_provider),
-        };
-        let gcs_client = StorageClient::with_interceptor(channel, interceptor);
-      
+        let gcs_client = StorageClient::new(channel);
+
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
@@ -224,6 +205,7 @@ where
                 .resumable_chunk_size
                 .unwrap_or(DEFAULT_CHUNK_SIZE as usize),
             resumable_max_concurrent_uploads: 0,
+            credential_provider,
         }))
     }
 
@@ -231,9 +213,18 @@ where
         format!("{}{}", self.key_prefix, key.as_str())
     }
 
-    /// Retrieve the GCS endpoint from an environment variable or default to Google's public endpoint.
-    fn get_gcs_endpoint() -> String {
-        env::var("GCS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
+    async fn inject_auth<F>(&self, mut request: Request<F>) -> Result<Request<F>, Status> {
+        let token = self
+            .credential_provider
+            .get_token()
+            .await
+            .map_err(|_| Status::unauthenticated("Failed to retrieve auth token"))?;
+        let auth_header = format!("Bearer {}", token);
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(auth_header).unwrap(),
+        );
+        Ok(request)
     }
 
     /// Check if the object exists and is not expired
@@ -246,13 +237,16 @@ where
 
                 async move {
                     let object_path = self.make_gcs_path(digest);
-                    let request = ReadObjectRequest {
+                    let raw_request = ReadObjectRequest {
                         bucket: self.bucket.clone(),
                         object: object_path.clone(),
                         ..Default::default()
                     };
 
-                    let result = client.read_object(request).await;
+                    let mut authenticated_request =
+                        self.inject_auth(Request::new(raw_request)).await?;
+
+                    let result = client.read_object(authenticated_request).await;
 
                     match result {
                         Ok(response) => {
