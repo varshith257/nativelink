@@ -129,10 +129,65 @@ impl CredentialProvider {
     }
 }
 
+#[async_trait]
+pub trait StorageClientTrait: Send + Sync {
+    async fn read_object(
+        &self,
+        request: Request<ReadObjectRequest>,
+    ) -> Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>;
+
+    async fn write_object(
+        &self,
+        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
+    ) -> Result<tonic::Response<WriteObjectResponse>, Status>;
+
+    async fn start_resumable_write(
+        &self,
+        request: Request<StartResumableWriteRequest>,
+    ) -> Result<tonic::Response<StartResumableWriteResponse>, Status>;
+
+    async fn query_write_status(
+        &self,
+        request: Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, Status>;
+}
+
+#[async_trait]
+impl StorageClientTrait for StorageClient<Channel> {
+    async fn read_object(
+        &self,
+        request: Request<ReadObjectRequest>,
+    ) -> Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status> {
+        self.read_object(request).await
+    }
+
+    async fn write_object(
+        &self,
+        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
+    ) -> Result<tonic::Response<WriteObjectResponse>, Status> {
+        self.write_object(request).await
+    }
+
+    async fn start_resumable_write(
+        &self,
+        request: Request<StartResumableWriteRequest>,
+    ) -> Result<tonic::Response<StartResumableWriteResponse>, Status> {
+        self.start_resumable_write(request).await
+    }
+
+    async fn query_write_status(
+        &self,
+        request: Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, Status> {
+        self.query_write_status(request).await
+    }
+}
+
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
-    gcs_client: Arc<StorageClient<Channel>>,
+    gcs_client: Arc<dyn StorageClientTrait>,
+    // gcs_client: Arc<StorageClient<Channel>>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
@@ -189,7 +244,8 @@ where
 
     pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
-        gcs_client: StorageClient<Channel>,
+        gcs_client: Arc<dyn StorageClientTrait>,
+        // gcs_client: StorageClient<Channel>,
         credential_provider: Arc<CredentialProvider>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
@@ -241,7 +297,8 @@ where
 
         self.retrier
             .retry(unfold((), move |state| {
-                let mut client = (*client).clone();
+                // let mut client = (*client).clone();
+                let client = Arc::clone(&client);
 
                 async move {
                     let object_path = self.make_gcs_path(digest);
@@ -362,7 +419,7 @@ where
                 .retrier
                 .retry(unfold((), move |()| {
                     let client = Arc::clone(&self.gcs_client);
-                    let mut client = (*client).clone();
+                    let client = Arc::clone(&client);
                     let gcs_path = gcs_path.clone();
                     let data = data.clone();
 
@@ -409,7 +466,6 @@ where
             .retrier
             .retry(unfold((), move |()| {
                 let client = Arc::clone(&self.gcs_client);
-                let mut client = (*client).clone();
                 let gcs_path = gcs_path.clone();
                 async move {
                     let write_spec = WriteObjectSpec {
@@ -499,7 +555,8 @@ where
         self.retrier
             .retry(unfold((), move |()| {
                 let client = Arc::clone(&self.gcs_client);
-                let mut client = (*client).clone();
+                // let mut client = (*client).clone();
+                let client = Arc::clone(&client);
                 let upload_id = Arc::clone(&upload_id);
                 async move {
                     let request = QueryWriteStatusRequest {
@@ -550,7 +607,8 @@ where
                     };
 
                     let client = Arc::clone(&self.gcs_client);
-                    let mut cloned_client = (*client).clone();
+                    // let mut cloned_client = (*client).clone();
+                    let cloned_client = Arc::clone(&client);
 
                     let result = cloned_client.read_object(request).await;
 
