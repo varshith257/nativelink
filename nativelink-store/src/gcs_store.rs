@@ -42,7 +42,7 @@ use rand::Rng;
 use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::{Request, Status};
+use tonic::{Request, Response, Status};
 
 // use tracing::{event, Level};
 use crate::cas_utils::is_zero_digest;
