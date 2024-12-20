@@ -19,13 +19,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     storage_client::StorageClient, write_object_request, ChecksummedData, Object,
-    QueryWriteStatusRequest, ReadObjectRequest, StartResumableWriteRequest, WriteObjectRequest,
-    WriteObjectSpec,
+    QueryWriteStatusRequest, QueryWriteStatusResponse, ReadObjectRequest, ReadObjectResponse,
+    StartResumableWriteRequest, StartResumableWriteResponse, WriteObjectRequest,
+    WriteObjectResponse, WriteObjectSpec,
 };
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error, ResultExt};
@@ -128,58 +130,57 @@ impl CredentialProvider {
         }
     }
 }
-
 #[async_trait]
 pub trait StorageClientTrait: Send + Sync {
-    async fn read_object(
+    fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
-    ) -> Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>;
+    ) -> BoxFuture<Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>;
 
-    async fn write_object(
+    fn write_object(
         &self,
-        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
-    ) -> Result<tonic::Response<WriteObjectResponse>, Status>;
+        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest> + Send + 'static,
+    ) -> BoxFuture<Result<tonic::Response<WriteObjectResponse>, Status>>;
 
-    async fn start_resumable_write(
+    fn start_resumable_write(
         &self,
         request: Request<StartResumableWriteRequest>,
-    ) -> Result<tonic::Response<StartResumableWriteResponse>, Status>;
+    ) -> BoxFuture<Result<tonic::Response<StartResumableWriteResponse>, Status>>;
 
-    async fn query_write_status(
+    fn query_write_status(
         &self,
         request: Request<QueryWriteStatusRequest>,
-    ) -> Result<tonic::Response<QueryWriteStatusResponse>, Status>;
+    ) -> BoxFuture<Result<tonic::Response<QueryWriteStatusResponse>, Status>>;
 }
-
 #[async_trait]
 impl StorageClientTrait for StorageClient<Channel> {
-    async fn read_object(
+    fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
-    ) -> Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status> {
-        self.read_object(request).await
+    ) -> BoxFuture<Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
+    {
+        Box::pin(async move { self.read_object(request).await })
     }
 
-    async fn write_object(
+    fn write_object(
         &self,
-        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
-    ) -> Result<tonic::Response<WriteObjectResponse>, Status> {
-        self.write_object(request).await
+        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest> + Send + 'static,
+    ) -> BoxFuture<Result<tonic::Response<WriteObjectResponse>, Status>> {
+        Box::pin(async move { self.write_object(request).await })
     }
 
-    async fn start_resumable_write(
+    fn start_resumable_write(
         &self,
         request: Request<StartResumableWriteRequest>,
-    ) -> Result<tonic::Response<StartResumableWriteResponse>, Status> {
-        self.start_resumable_write(request).await
+    ) -> BoxFuture<Result<tonic::Response<StartResumableWriteResponse>, Status>> {
+        Box::pin(async move { self.start_resumable_write(request).await })
     }
 
-    async fn query_write_status(
+    fn query_write_status(
         &self,
         request: Request<QueryWriteStatusRequest>,
-    ) -> Result<tonic::Response<QueryWriteStatusResponse>, Status> {
-        self.query_write_status(request).await
+    ) -> BoxFuture<Result<tonic::Response<QueryWriteStatusResponse>, Status>> {
+        Box::pin(async move { self.query_write_status(request).await })
     }
 }
 
