@@ -39,7 +39,6 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
-use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
@@ -125,9 +124,6 @@ impl CredentialProvider {
         if let Ok(token) = env::var("GCS_AUTH_TOKEN") {
             return Ok(token);
         }
-
-        let token = String::from_utf8(output.stdout)
-            .map_err(|e| make_err!(Code::Unavailable, "Invalid UTF-8 token: {e:?}"))?;
         Ok(token.trim().to_string())
     }
 }
@@ -195,27 +191,21 @@ where
 
         let credential_provider = Arc::new(CredentialProvider::new().await?);
 
-        // let gcs_client = StorageClient::new(channel);
+        Self::new_with_client_and_jitter(spec, channel, credential_provider, jitter_fn, now_fn)
+    }
+
+    pub fn new_with_client_and_jitter(
+        spec: &GCSSpec,
+        channel: Channel,
+        credential_provider: Arc<CredentialProvider>,
+        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
+        now_fn: NowFn,
+    ) -> Result<Arc<Self>, Error> {
         let interceptor = AuthInterceptor {
             token_provider: Arc::clone(&credential_provider),
         };
         let gcs_client = StorageClient::with_interceptor(channel, interceptor);
-
-        Self::new_with_client_and_jitter(spec, gcs_client, jitter_fn, now_fn)
-    }
-
-    pub fn new_with_client_and_jitter<C>(
-        spec: &GCSSpec,
-        gcs_client: StorageClient<C>,
-        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
-        now_fn: NowFn,
-    ) -> Result<Arc<Self>, Error>
-    where
-        C: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + Sync + 'static,
-        C::ResponseBody: Send + Sync + 'static,
-        C::Error: Into<tonic::Status> + Send + Sync + 'static,
-        C::Future: Send + 'static,
-    {
+      
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
