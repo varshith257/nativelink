@@ -56,8 +56,29 @@ const BUCKET_NAME: &str = "dummy-bucket-name";
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 const REGION: &str = "testregion";
 
+#[async_trait::async_trait]
+pub trait StorageClientTrait: Send + Sync {
+    async fn read_object(
+        &self,
+        request: Request<ReadObjectRequest>,
+    ) -> Result<Response<ReadObjectResponse>, Status>;
+}
+
+#[async_trait::async_trait]
+impl StorageClientTrait for StorageClient<Channel> {
+    async fn read_object(
+        &self,
+        request: Request<ReadObjectRequest>,
+    ) -> Result<Response<ReadObjectResponse>, Status> {
+        self.read_object(request).await
+    }
+}
+
 mock! {
-    pub StorageClient {
+    pub StorageClient {}
+
+    #[async_trait::async_trait]
+    impl StorageClientTrait for StorageClient {
         async fn read_object(
             &self,
             request: Request<ReadObjectRequest>,
@@ -67,16 +88,15 @@ mock! {
 
 fn setup_mock_client(
     response: Result<Response<ReadObjectResponse>, Status>,
-) -> Arc<StorageClient<Channel>> {
+) -> Arc<dyn StorageClientTrait> {
     let mut mock_client = MockStorageClient::new();
     mock_client.expect_read_object().return_once(|_| response);
 
-    // Wrap the mock in `Arc` to match `GCSStore` expectations
     Arc::new(mock_client)
 }
 
 async fn create_gcs_store(
-    mock_client: Arc<StorageClient<Channel>>,
+    mock_client: Arc<dyn StorageClientTrait>,
 ) -> Arc<GCSStore<impl Fn() -> MockInstantWrapped + Send + Sync>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 
