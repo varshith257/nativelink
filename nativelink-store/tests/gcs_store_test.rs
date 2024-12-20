@@ -23,12 +23,8 @@ use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
 use bytes::{BufMut, Bytes, BytesMut};
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
-    storage_client::StorageClient, write_object_request, ChecksummedData, Object as GcsObject,
-    ReadObjectRequest, ReadObjectResponse,
+    storage_client::StorageClient, Object as GcsObject, ReadObjectRequest, ReadObjectResponse,
 };
-use http::header;
-use http::status::StatusCode;
-use hyper::Body;
 use mock_instant::thread_local::MockClock;
 use mockall::{automock, mock, predicate::*};
 use nativelink_config::stores::GCSSpec;
@@ -60,24 +56,25 @@ const BUCKET_NAME: &str = "dummy-bucket-name";
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 const REGION: &str = "testregion";
 
-#[automock]
-#[async_trait]
-pub trait StorageClientTrait: Send + Sync {
-    async fn read_object(
-        &mut self,
-        request: Request<ReadObjectRequest>,
-    ) -> Result<Response<ReadObjectResponse>, Status>;
+mock! {
+    pub StorageClient {}
+
+    #[async_trait::async_trait]
+    impl StorageClient for StorageClient<Channel> {
+        async fn read_object(
+            &self,
+            request: Request<ReadObjectRequest>,
+        ) -> Result<Response<ReadObjectResponse>, Status>;
+    }
 }
 
-fn setup_mock_client(
-    response: Result<Response<ReadObjectResponse>, Status>,
-) -> MockStorageClientTrait {
-    let mut mock_client = MockStorageClientTrait::new();
+fn setup_mock_client(response: Result<Response<ReadObjectResponse>, Status>) -> MockStorageClient {
+    let mut mock_client = MockStorageClient::new();
     mock_client.expect_read_object().return_once(|_| response);
     mock_client
 }
 
-async fn create_gcs_store(mock_client: MockStorageClientTrait) -> GCSStore<MockInstantWrapped> {
+async fn create_gcs_store(mock_client: MockStorageClient) -> Arc<GCSStore<MockInstantWrapped>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 
     GCSStore::new_with_client_and_jitter(
@@ -86,10 +83,11 @@ async fn create_gcs_store(mock_client: MockStorageClientTrait) -> GCSStore<MockI
             ..Default::default()
         },
         Arc::new(mock_client),
-        Arc::new(move |_delay| Duration::from_secs(0)),
         credential_provider,
+        Arc::new(move |_delay| Duration::from_secs(0)),
         MockInstantWrapped::default,
-    )?;
+    )
+    .unwrap()
 }
 
 #[nativelink_test]
