@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_lock::Mutex;
 use async_trait::async_trait;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
@@ -69,6 +70,82 @@ These differences emphasize the need for tailored approaches to storage backends
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
+/// `CredentialProvider` manages the authentication token required for GCS operations.
+/// It fetches tokens dynamically and ensures they are refreshed periodically.
+pub struct CredentialProvider {
+    token: Arc<tokio::sync::Mutex<(String, Instant)>>,
+}
+
+impl CredentialProvider {
+    async fn new() -> Result<Self, Error> {
+        let token = Self::fetch_gcs_token().await?;
+        let expiry = Instant::now() + Duration::from_secs(3600); // Default expiry duration
+        Ok(Self {
+            token: Arc::new(tokio::sync::Mutex::new((token, expiry))),
+        })
+    }
+
+    /// Fetch a new token if the current token is expired.
+    async fn get_token(&mut self) -> Result<String, Error> {
+        let mut lock = self.token.lock().await;
+
+        if Instant::now() >= lock.1 {
+            lock.0 = Self::fetch_gcs_token().await?;
+            lock.1 = Instant::now() + Duration::from_secs(3600);
+        }
+        Ok(lock.0.clone())
+    }
+
+    /// Starts a background task to refresh the token periodically.
+    /// This ensures the token remains valid for ongoing operations.
+    pub async fn start_token_refresh(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                {
+                    let mut lock = self.token.lock().await;
+                    lock.0 = Self::fetch_gcs_token()
+                        .await
+                        .unwrap_or_else(|_| "".to_string());
+                    lock.1 = Instant::now() + Duration::from_secs(3600);
+                }
+                sleep(Duration::from_secs(3500)).await; // Refresh before expiry
+            }
+        });
+    }
+
+    pub fn get_token_sync(&self) -> String {
+        // Returns the current token synchronously
+        let lock = self.token.blocking_lock();
+        lock.0.clone()
+    }
+
+    /// Fetches a GCS token using either an environment variable or the `gcloud` CLI.
+    async fn fetch_gcs_token() -> Result<String, Error> {
+        if let Ok(token) = env::var("GCS_AUTH_TOKEN") {
+            return Ok(token);
+        }
+
+        // Fallback to using `gcloud` CLI to retrieve the access token
+        let output = std::process::Command::new("gcloud")
+            .arg("auth")
+            .arg("print-access-token")
+            .output()
+            .map_err(|e| make_err!(Code::Unavailable, "Failed to execute gcloud command: {e:?}"))?;
+
+        if !output.status.success() {
+            return Err(make_err!(
+                Code::Unauthenticated,
+                "Failed to retrieve token via gcloud: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let token = String::from_utf8(output.stdout)
+            .map_err(|e| make_err!(Code::Unavailable, "Invalid UTF-8 token: {e:?}"))?;
+        Ok(token.trim().to_string())
+    }
+}
+
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
@@ -94,6 +171,12 @@ where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
+    /// Retrieve the GCS endpoint from an environment variable or default to Google's public endpoint.
+    fn get_gcs_endpoint() -> String {
+        env::var("GCS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
+    }
+
+    /// Create a GCS client with an interceptor for dynamic token injection.
     pub async fn new(spec: &GCSSpec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
         let jitter_amt = spec.retry.jitter;
         let jitter_fn = Arc::new(move |delay: Duration| {
@@ -104,20 +187,32 @@ where
             let max = 1. + (jitter_amt / 2.);
             delay.mul_f32(OsRng.gen_range(min..max))
         });
-        let endpoint = get_gcs_endpoint();
+        let endpoint = Self::get_gcs_endpoint();
 
         let channel = tonic::transport::Channel::from_static(&endpoint)
             .connect()
             .await
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
-        let token = get_auth_token();
-        let client = StorageClient::with_interceptor(channel, move |mut req: Request<()>| {
-            let token_header = format!("Bearer {}", token);
-            req.metadata_mut().insert(
-                "authorization",
-                MetadataValue::try_from(token_header).unwrap(),
-            );
-            Ok(req)
+
+        let credential_provider = Arc::new(CredentialProvider::new().await?);
+        credential_provider.start_token_refresh().await;
+
+        let client = StorageClient::with_interceptor(channel, {
+            let provider = Arc::clone(&credential_provider);
+
+            move |mut req: Request<()>| {
+                let token = provider.get_token_sync();
+                if token.is_empty() {
+                    return Err(Status::unauthenticated("Token unavailable"));
+                }
+
+                let token_header = format!("Bearer {}", token);
+                req.metadata_mut().insert(
+                    "authorization",
+                    MetadataValue::try_from(token_header).unwrap(),
+                );
+                Ok(req)
+            }
         });
 
         // let gcs_client = StorageClient::new(channel);
@@ -125,12 +220,18 @@ where
         Self::new_with_client_and_jitter(spec, client, jitter_fn, now_fn)
     }
 
-    pub fn new_with_client_and_jitter(
+    pub fn new_with_client_and_jitter<T>(
         spec: &GCSSpec,
-        gcs_client: StorageClient<tonic::transport::Channel>,
+        gcs_client: StorageClient<T>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
-    ) -> Result<Arc<Self>, Error> {
+    ) -> Result<Arc<Self>, Error>
+    where
+        T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+        T::ResponseBody: Send + 'static,
+        T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
@@ -154,16 +255,6 @@ where
 
     fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
         format!("{}{}", self.key_prefix, key.as_str())
-    }
-
-    /// Retrieve authentication token from an environment variable.
-    fn get_auth_token() -> String {
-        env::var("GCS_AUTH_TOKEN").expect("GCS_AUTH_TOKEN environment variable not set")
-    }
-
-    /// Retrieve the GCS endpoint from an environment variable or default to Google's public endpoint.
-    fn get_gcs_endpoint() -> String {
-        env::var("GCS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
     }
 
     /// Check if the object exists and is not expired
