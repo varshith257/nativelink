@@ -130,56 +130,55 @@ impl CredentialProvider {
         }
     }
 }
-#[async_trait]
 pub trait StorageClientTrait: Send + Sync {
     fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
-    ) -> BoxFuture<Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>;
+    ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>;
 
     fn write_object(
         &self,
-        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest> + Send + 'static,
-    ) -> BoxFuture<Result<tonic::Response<WriteObjectResponse>, Status>>;
+        request: Request<WriteObjectRequest>,
+    ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>>;
 
     fn start_resumable_write(
         &self,
         request: Request<StartResumableWriteRequest>,
-    ) -> BoxFuture<Result<tonic::Response<StartResumableWriteResponse>, Status>>;
+    ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>>;
 
     fn query_write_status(
         &self,
         request: Request<QueryWriteStatusRequest>,
-    ) -> BoxFuture<Result<tonic::Response<QueryWriteStatusResponse>, Status>>;
+    ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>>;
 }
-#[async_trait]
+
 impl StorageClientTrait for StorageClient<Channel> {
     fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
-    ) -> BoxFuture<Result<tonic::Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
+    ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
     {
         Box::pin(async move { self.read_object(request).await })
     }
 
     fn write_object(
         &self,
-        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest> + Send + 'static,
-    ) -> BoxFuture<Result<tonic::Response<WriteObjectResponse>, Status>> {
+        request: Request<WriteObjectRequest>,
+    ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>> {
         Box::pin(async move { self.write_object(request).await })
     }
 
     fn start_resumable_write(
         &self,
         request: Request<StartResumableWriteRequest>,
-    ) -> BoxFuture<Result<tonic::Response<StartResumableWriteResponse>, Status>> {
+    ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>> {
         Box::pin(async move { self.start_resumable_write(request).await })
     }
 
     fn query_write_status(
         &self,
         request: Request<QueryWriteStatusRequest>,
-    ) -> BoxFuture<Result<tonic::Response<QueryWriteStatusResponse>, Status>> {
+    ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>> {
         Box::pin(async move { self.query_write_status(request).await })
     }
 }
@@ -478,10 +477,10 @@ where
                         ..Default::default()
                     };
 
-                    let request = StartResumableWriteRequest {
+                    let request = tonic::Request::new(StartResumableWriteRequest {
                         write_object_spec: Some(write_spec),
                         ..Default::default()
-                    };
+                    });
 
                     let result = client.start_resumable_write(request).await.map_err(|e| {
                         make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}")
@@ -560,10 +559,10 @@ where
                 let client = Arc::clone(&client);
                 let upload_id = Arc::clone(&upload_id);
                 async move {
-                    let request = QueryWriteStatusRequest {
+                    let request = tonic::Request::new(QueryWriteStatusRequest {
                         upload_id: (*upload_id).clone(),
                         ..Default::default()
-                    };
+                    });
 
                     let result = client.query_write_status(request).await.map_err(|e| {
                         make_err!(Code::Unavailable, "Failed to finalize upload: {e:?}")
@@ -599,13 +598,13 @@ where
             .retry(unfold(writer, move |writer| {
                 let path = gcs_path.clone();
                 async move {
-                    let request = ReadObjectRequest {
+                    let request = tonic::Request::new(ReadObjectRequest {
                         bucket: self.bucket.clone(),
                         object: path.clone(),
                         read_offset: offset as i64,
                         read_limit: length.unwrap_or(0) as i64,
                         ..Default::default()
-                    };
+                    });
 
                     let client = Arc::clone(&self.gcs_client);
                     // let mut cloned_client = (*client).clone();
