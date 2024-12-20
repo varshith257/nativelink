@@ -183,7 +183,7 @@ where
 
     pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
-        gcs_client: Arc<StorageClient<Channel>>,
+        gcs_client: StorageClient<Channel>,
         credential_provider: Arc<CredentialProvider>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
