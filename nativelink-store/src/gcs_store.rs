@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +38,9 @@ use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rand::rngs::OsRng;
 use rand::Rng;
 use tokio::time::sleep;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
+use tonic::{Request, Status};
 
 // use tracing::{event, Level};
 use crate::cas_utils::is_zero_digest;
@@ -101,15 +104,25 @@ where
             let max = 1. + (jitter_amt / 2.);
             delay.mul_f32(OsRng.gen_range(min..max))
         });
+        let endpoint = get_gcs_endpoint();
 
-        let channel = tonic::transport::Channel::from_static("https://storage.googleapis.com")
+        let channel = tonic::transport::Channel::from_static(&endpoint)
             .connect()
             .await
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
+        let token = get_auth_token();
+        let client = StorageClient::with_interceptor(channel, move |mut req: Request<()>| {
+            let token_header = format!("Bearer {}", token);
+            req.metadata_mut().insert(
+                "authorization",
+                MetadataValue::try_from(token_header).unwrap(),
+            );
+            Ok(req)
+        });
 
-        let gcs_client = StorageClient::new(channel);
+        // let gcs_client = StorageClient::new(channel);
 
-        Self::new_with_client_and_jitter(spec, gcs_client, jitter_fn, now_fn)
+        Self::new_with_client_and_jitter(spec, client, jitter_fn, now_fn)
     }
 
     pub fn new_with_client_and_jitter(
@@ -141,6 +154,16 @@ where
 
     fn make_gcs_path(&self, key: &StoreKey<'_>) -> String {
         format!("{}{}", self.key_prefix, key.as_str())
+    }
+
+    /// Retrieve authentication token from an environment variable.
+    fn get_auth_token() -> String {
+        env::var("GCS_AUTH_TOKEN").expect("GCS_AUTH_TOKEN environment variable not set")
+    }
+
+    /// Retrieve the GCS endpoint from an environment variable or default to Google's public endpoint.
+    fn get_gcs_endpoint() -> String {
+        env::var("GCS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
     }
 
     /// Check if the object exists and is not expired
