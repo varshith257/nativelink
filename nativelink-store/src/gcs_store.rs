@@ -18,7 +18,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_lock::Mutex;
 use async_trait::async_trait;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
@@ -149,7 +148,7 @@ impl CredentialProvider {
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
-    gcs_client: Arc<StorageClient<Channel>>,
+    gcs_client: Arc<StorageClient<T>>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
@@ -220,12 +219,18 @@ where
         Self::new_with_client_and_jitter(spec, client, jitter_fn, now_fn)
     }
 
-    pub fn new_with_client_and_jitter(
+    pub fn new_with_client_and_jitter<T>(
         spec: &GCSSpec,
-        gcs_client: StorageClient<Channel>,
+        gcs_client: StorageClient<T>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
-    ) -> Result<Arc<Self>, Error> {
+    ) -> Result<Arc<Self>, Error>
+    where
+        T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+        T::ResponseBody: Send + 'static,
+        T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
