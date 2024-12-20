@@ -65,14 +65,18 @@ mock! {
     }
 }
 
-fn setup_mock_client(response: Result<Response<ReadObjectResponse>, Status>) -> MockStorageClient {
+fn setup_mock_client(
+    response: Result<Response<ReadObjectResponse>, Status>,
+) -> Arc<StorageClient<Channel>> {
     let mut mock_client = MockStorageClient::new();
     mock_client.expect_read_object().return_once(|_| response);
-    mock_client
+
+    // Wrap the mock in `Arc` to match `GCSStore` expectations
+    Arc::new(mock_client)
 }
 
 async fn create_gcs_store(
-    mock_client: MockStorageClient,
+    mock_client: Arc<StorageClient<Channel>>,
 ) -> Arc<GCSStore<impl Fn() -> MockInstantWrapped + Send + Sync>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 
@@ -81,7 +85,7 @@ async fn create_gcs_store(
             bucket: BUCKET_NAME.to_string(),
             ..Default::default()
         },
-        Arc::new(mock_client),
+        mock_client,
         credential_provider,
         Arc::new(move |_delay| Duration::from_secs(0)),
         || MockInstantWrapped::default(),
