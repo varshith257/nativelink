@@ -57,7 +57,7 @@ const VALID_HASH1: &str = "0123456789abcdef0000000000000000000100000000000001234
 const REGION: &str = "testregion";
 
 mock! {
-    pub StorageClient<Channel> {
+    pub StorageClient {
         async fn read_object(
             &self,
             request: Request<ReadObjectRequest>,
@@ -65,16 +65,14 @@ mock! {
     }
 }
 
-fn setup_mock_client(
-    response: Result<Response<ReadObjectResponse>, Status>,
-) -> MockStorageClient<Channel> {
-    let mut mock_client = MockStorageClient::<Channel>::new();
+fn setup_mock_client(response: Result<Response<ReadObjectResponse>, Status>) -> MockStorageClient {
+    let mut mock_client = MockStorageClient::new();
     mock_client.expect_read_object().return_once(|_| response);
     mock_client
 }
 
 async fn create_gcs_store(
-    mock_client: MockStorageClient<Channel>,
+    mock_client: MockStorageClient,
 ) -> Arc<GCSStore<impl Fn() -> MockInstantWrapped + Send + Sync>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 
