@@ -15,7 +15,6 @@
 use std::borrow::Cow;
 use std::env;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,6 +33,7 @@ use mock_instant::thread_local::MockClock;
 use mockall::{automock, mock, predicate::*};
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error, ResultExt};
+use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_store::gcs_store::CredentialProvider;
 use nativelink_store::gcs_store::GCSStore;
@@ -44,7 +44,6 @@ use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::instant_wrapper::MockInstantWrapped;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::spawn;
-use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use nativelink_util::store_trait::{StoreLike, UploadSizeInfo};
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -55,31 +54,30 @@ use tonic::Response;
 use tonic::{Request, Status};
 
 // use tracing::{event, Level};
-use crate::cas_utils::is_zero_digest;
+// use crate::cas_utils::is_zero_digest;
 
 const BUCKET_NAME: &str = "dummy-bucket-name";
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 const REGION: &str = "testregion";
 
-mock! {
-    pub StorageClient {}
-
-    #[async_trait]
-    impl StorageClient for StorageClient {
-        async fn read_object(
-            &mut self,
-            request: tonic::Request<ReadObjectRequest>,
-        ) -> Result<Response<ReadObjectResponse>, Status>;
-    }
+#[automock]
+#[async_trait]
+pub trait StorageClientTrait: Send + Sync {
+    async fn read_object(
+        &mut self,
+        request: Request<ReadObjectRequest>,
+    ) -> Result<Response<ReadObjectResponse>, Status>;
 }
 
-fn setup_mock_client(response: Result<Response<ReadObjectResponse>, Status>) -> MockStorageClient {
-    let mut mock_client = MockStorageClient::new();
+fn setup_mock_client(
+    response: Result<Response<ReadObjectResponse>, Status>,
+) -> MockStorageClientTrait {
+    let mut mock_client = MockStorageClientTrait::new();
     mock_client.expect_read_object().return_once(|_| response);
     mock_client
 }
 
-async fn create_gcs_store(mock_client: MockStorageClient) -> GCSStore<MockInstantWrapped> {
+async fn create_gcs_store(mock_client: MockStorageClientTrait) -> GCSStore<MockInstantWrapped> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 
     GCSStore::new_with_client_and_jitter(
