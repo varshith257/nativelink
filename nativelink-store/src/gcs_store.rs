@@ -154,7 +154,7 @@ pub trait StorageClientTrait: Send + Sync {
 
 impl StorageClientTrait for StorageClient<Channel> {
     fn read_object(
-        &self,
+        self: Arc<Self>,
         request: Request<ReadObjectRequest>,
     ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
     {
@@ -162,21 +162,21 @@ impl StorageClientTrait for StorageClient<Channel> {
     }
 
     fn write_object(
-        &self,
+        self: Arc<Self>,
         request: Request<WriteObjectRequest>,
     ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>> {
         Box::pin(async move { self.write_object(request).await })
     }
 
     fn start_resumable_write(
-        &self,
+        self: Arc<Self>,
         request: Request<StartResumableWriteRequest>,
     ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>> {
         Box::pin(async move { self.start_resumable_write(request).await })
     }
 
     fn query_write_status(
-        &self,
+        self: Arc<Self>,
         request: Request<QueryWriteStatusRequest>,
     ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>> {
         Box::pin(async move { self.query_write_status(request).await })
@@ -233,13 +233,7 @@ where
         let credential_provider = Arc::new(CredentialProvider::new().await?);
         let gcs_client = StorageClient::new(channel);
 
-        Self::new_with_client_and_jitter(
-            spec,
-            gcs_client.into(),
-            credential_provider,
-            jitter_fn,
-            now_fn,
-        )
+        Self::new_with_client_and_jitter(spec, gcs_client, credential_provider, jitter_fn, now_fn)
     }
 
     pub fn new_with_client_and_jitter(
@@ -514,26 +508,27 @@ where
             self.retrier
                 .retry(unfold(data, move |data| {
                     let client = Arc::clone(&self.gcs_client);
-                    let mut client = (*client).clone();
+                    let mut client = Arc::clone(&client);
                     let upload_id = Arc::clone(&upload_id);
                     let data = data.clone();
                     let offset = offset;
 
                     async move {
-                        let request_stream = stream::iter(vec![WriteObjectRequest {
-                            first_message: Some(write_object_request::FirstMessage::UploadId(
-                                (*upload_id).clone(),
-                            )),
-                            write_offset: offset as i64,
-                            finish_write: is_last_chunk,
-                            data: Some(write_object_request::Data::ChecksummedData(
-                                ChecksummedData {
-                                    content: data.to_vec(),
-                                    crc32c: Some(crc32c::crc32c(&data)),
-                                },
-                            )),
-                            ..Default::default()
-                        }]);
+                        let request_stream =
+                            stream::iter(vec![tonic::Request::new(WriteObjectRequest {
+                                first_message: Some(write_object_request::FirstMessage::UploadId(
+                                    (*upload_id).clone(),
+                                )),
+                                write_offset: offset as i64,
+                                finish_write: is_last_chunk,
+                                data: Some(write_object_request::Data::ChecksummedData(
+                                    ChecksummedData {
+                                        content: data.to_vec(),
+                                        crc32c: Some(crc32c::crc32c(&data)),
+                                    },
+                                )),
+                                ..Default::default()
+                            })]);
 
                         let result = client
                             .write_object(request_stream)
