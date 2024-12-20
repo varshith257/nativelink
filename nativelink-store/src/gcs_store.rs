@@ -38,7 +38,7 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rand::rngs::OsRng;
 use rand::Rng;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
@@ -220,18 +220,12 @@ where
         Self::new_with_client_and_jitter(spec, client, jitter_fn, now_fn)
     }
 
-    pub fn new_with_client_and_jitter<T>(
+    pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
-        gcs_client: StorageClient<T>,
+        gcs_client: StorageClient<Channel>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
-    ) -> Result<Arc<Self>, Error>
-    where
-        T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
-        T::ResponseBody: Send + 'static,
-        T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
+    ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
