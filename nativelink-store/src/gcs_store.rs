@@ -76,7 +76,7 @@ pub struct CredentialProvider {
 }
 
 impl CredentialProvider {
-    async fn new() -> Result<Self, Error> {
+    pub async fn new() -> Result<Self, Error> {
         let token = Self::fetch_gcs_token().await?;
         let expiry = Instant::now() + Duration::from_secs(3600); // Default expiry duration
         Ok(Self {
@@ -137,7 +137,7 @@ pub struct GCSStore<NowFn> {
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
     #[metric(help = "The key prefix for the GCS store")]
-    key_prefix: String,
+    pub key_prefix: String,
     retrier: Retrier,
     #[metric(help = "The number of seconds to consider an object expired")]
     consider_expired_after_s: i64,
@@ -176,19 +176,18 @@ where
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
 
         let credential_provider = Arc::new(CredentialProvider::new().await?);
+        let gcs_client = StorageClient::new(channel);
 
-        Self::new_with_client_and_jitter(spec, channel, credential_provider, jitter_fn, now_fn)
+        Self::new_with_client_and_jitter(spec, gcs_client, credential_provider, jitter_fn, now_fn)
     }
 
     pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
-        channel: Channel,
+        gcs_client: Arc<StorageClient<Channel>>,
         credential_provider: Arc<CredentialProvider>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
     ) -> Result<Arc<Self>, Error> {
-        let gcs_client = StorageClient::new(channel);
-
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,

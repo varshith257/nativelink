@@ -1,0 +1,22 @@
+{
+    "gcs_store": {
+      "bucket": "example-bucket-name",
+      "key_prefix": "path/to/store/prefix/",
+      "credentials": {
+        "gcs_auth_token": "YOUR_AUTH_TOKEN_HERE"
+      },
+      "retry": {
+        "max_retries": 5,
+        "initial_delay": 1,
+        "max_delay": 30,
+        "jitter": 0.2
+      },
+      "upload": {
+        "max_retry_buffer_per_request": 8388608,
+        "resumable_chunk_size": 8388608,
+        "resumable_max_concurrent_uploads": 3
+      },
+      "object_expiry_seconds": 86400
+    }
+  }
+  

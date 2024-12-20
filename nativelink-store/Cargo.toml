@@ -59,6 +59,7 @@ tracing = { version = "0.1.41", default-features = false }
 uuid = { version = "1.11.0", default-features = false, features = ["v4", "serde"] }
 googleapis-tonic-google-storage-v2 = "0.16.0"
 crc32c = "0.6.8"
+mockall = "0.13.1"
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
