@@ -164,7 +164,7 @@ pub struct GCSStore<NowFn, T> {
     resumable_max_concurrent_uploads: usize,
 }
 
-impl<I, NowFn> GCSStore<NowFn, T>
+impl<I, NowFn, T> GCSStore<NowFn, T>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
@@ -312,10 +312,14 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn> StoreDriver for GCSStore<NowFn>
+impl<I, NowFn, T> StoreDriver for GCSStore<NowFn, T>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+    T::ResponseBody: Send + 'static,
+    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     async fn has_with_results(
         self: Pin<&Self>,
@@ -649,10 +653,14 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn> HealthStatusIndicator for GCSStore<NowFn>
+impl<I, NowFn, T> HealthStatusIndicator for GCSStore<NowFn, T>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Sync + 'static,
+    T::ResponseBody: Send + 'static,
+    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    <T::ResponseBody as http_body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     fn get_name(&self) -> &'static str {
         "GCSStore"
