@@ -86,9 +86,10 @@ impl CredentialProvider {
     }
 
     /// Fetch a new token if the current token is expired.
-    async fn get_token(&mut self) -> Result<String, Error> {
+    pub async fn get_token(&self) -> Result<String, Error> {
         let mut lock = self.token.lock().await;
 
+        // Refresh the token if it has expired
         if Instant::now() >= lock.1 {
             lock.0 = Self::fetch_gcs_token().await?;
             lock.1 = Instant::now() + Duration::from_secs(3600);
@@ -122,7 +123,7 @@ impl CredentialProvider {
     /// Fetches a GCS token using either an environment variable or the `gcloud` CLI.
     async fn fetch_gcs_token() -> Result<String, Error> {
         if let Ok(token) = env::var("GCS_AUTH_TOKEN") {
-            Ok(token.trim().to_string());
+            Ok(token.trim().to_string())
         } else {
             Err(make_err!(Code::Unavailable, "GCS_AUTH_TOKEN not found"))
         }
@@ -216,7 +217,8 @@ where
     }
 
     async fn inject_auth<F>(&self, mut request: Request<F>) -> Result<Request<F>, Status> {
-        let token = Arc::clone(&self.credential_provider)
+        let token = self
+            .credential_provider
             .get_token()
             .await
             .map_err(|_| Status::unauthenticated("Failed to retrieve auth token"))?;
