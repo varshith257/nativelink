@@ -178,7 +178,7 @@ where
         let credential_provider = Arc::new(CredentialProvider::new().await?);
         let gcs_client = StorageClient::new(channel);
 
-        Self::new_with_client_and_jitter(spec, gcs_client, credential_provider, jitter_fn, now_fn)
+        Self::new_with_client_and_jitter(spec, gcs_client.into(), credential_provider, jitter_fn, now_fn)
     }
 
     pub fn new_with_client_and_jitter(
