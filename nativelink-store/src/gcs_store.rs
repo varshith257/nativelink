@@ -42,6 +42,7 @@ use rand::Rng;
 use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
+use tonic::Streaming;
 use tonic::{Request, Response, Status};
 
 // use tracing::{event, Level};
@@ -154,7 +155,7 @@ pub trait StorageClientTrait: Send + Sync {
 
 impl StorageClientTrait for StorageClient<Channel> {
     fn read_object(
-        self: Arc<Self>,
+        &self,
         request: Request<ReadObjectRequest>,
     ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
     {
@@ -162,21 +163,21 @@ impl StorageClientTrait for StorageClient<Channel> {
     }
 
     fn write_object(
-        self: Arc<Self>,
+        &self,
         request: Request<WriteObjectRequest>,
     ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>> {
         Box::pin(async move { self.write_object(request).await })
     }
 
     fn start_resumable_write(
-        self: Arc<Self>,
+        &self,
         request: Request<StartResumableWriteRequest>,
     ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>> {
         Box::pin(async move { self.start_resumable_write(request).await })
     }
 
     fn query_write_status(
-        self: Arc<Self>,
+        &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>> {
         Box::pin(async move { self.query_write_status(request).await })
@@ -231,7 +232,7 @@ where
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
 
         let credential_provider = Arc::new(CredentialProvider::new().await?);
-        let gcs_client = StorageClient::new(channel);
+        let gcs_client: Arc<dyn StorageClientTrait> = Arc::new(StorageClient::new(channel));
 
         Self::new_with_client_and_jitter(spec, gcs_client, credential_provider, jitter_fn, now_fn)
     }
@@ -441,8 +442,10 @@ where
                             ..Default::default()
                         }]);
 
+                        let request = tonic::Request::new(request_stream);
+
                         let result = client
-                            .write_object(request_stream)
+                            .write_object(request)
                             .await
                             .map_err(|e| make_err!(Code::Aborted, "WriteObject failed: {e:?}"));
 
@@ -530,8 +533,10 @@ where
                                 ..Default::default()
                             })]);
 
+                        let request = tonic::Request::new(request_stream);
+
                         let result = client
-                            .write_object(request_stream)
+                            .write_object(request)
                             .await
                             .map_err(|e| make_err!(Code::Aborted, "Failed to upload chunk: {e:?}"));
 
