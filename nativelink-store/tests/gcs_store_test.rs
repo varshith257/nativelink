@@ -23,7 +23,9 @@ use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
 use bytes::{BufMut, Bytes, BytesMut};
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
-    storage_client::StorageClient, Object as GcsObject, ReadObjectRequest, ReadObjectResponse,
+    storage_client::StorageClient, write_object_request, ChecksummedData, Object,
+    QueryWriteStatusRequest, ReadObjectRequest, StartResumableWriteRequest, WriteObjectRequest,
+    WriteObjectSpec,
 };
 use mock_instant::thread_local::MockClock;
 use mockall::{automock, mock, predicate::*};
@@ -56,21 +58,60 @@ const BUCKET_NAME: &str = "dummy-bucket-name";
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 const REGION: &str = "testregion";
 
-#[async_trait::async_trait]
-pub trait StorageClientTrait: Send + Sync {
-    async fn read_object(
+pub trait MockableStorageClient: Send + Sync {
+    fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
-    ) -> Result<Response<ReadObjectResponse>, Status>;
+    ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>;
+
+    // fn write_object(
+    //     &self,
+    //     request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
+    // ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>>;
+
+    fn start_resumable_write(
+        &self,
+        request: Request<StartResumableWriteRequest>,
+    ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>>;
+
+    fn query_write_status(
+        &self,
+        request: Request<QueryWriteStatusRequest>,
+    ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>>;
 }
 
-#[async_trait::async_trait]
-impl StorageClientTrait for StorageClient<Channel> {
-    async fn read_object(
+impl MockableStorageClientTrait for StorageClient<Channel> {
+    fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
-    ) -> Result<Response<ReadObjectResponse>, Status> {
-        self.read_object(request).await
+    ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
+    {
+        let client = self.clone();
+        Box::pin(async move { client.read_object(request).await })
+    }
+
+    // fn write_object(
+    //     &self,
+    //     request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
+    // ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>> {
+    //     let client = self.clone();
+    //     Box::pin(async move { client.write_object(request).await })
+    // }
+
+    fn start_resumable_write(
+        &self,
+        request: Request<StartResumableWriteRequest>,
+    ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>> {
+        let client = self.clone();
+        Box::pin(async move { client.start_resumable_write(request).await })
+    }
+
+    fn query_write_status(
+        &self,
+        request: Request<QueryWriteStatusRequest>,
+    ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>> {
+        let client = self.clone();
+        Box::pin(async move { client.query_write_status(request).await })
     }
 }
 
@@ -88,7 +129,7 @@ mock! {
 
 fn setup_mock_client(
     response: Result<Response<ReadObjectResponse>, Status>,
-) -> Arc<dyn StorageClientTrait> {
+) -> Arc<dyn MockableStorageClient> {
     let mut mock_client = MockStorageClient::new();
     mock_client.expect_read_object().return_once(|_| response);
 
@@ -96,7 +137,7 @@ fn setup_mock_client(
 }
 
 async fn create_gcs_store(
-    mock_client: Arc<dyn StorageClientTrait>,
+    mock_client: Arc<dyn MockableStorageClient>,
 ) -> Arc<GCSStore<impl Fn() -> MockInstantWrapped + Send + Sync>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 

@@ -19,15 +19,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     storage_client::StorageClient, write_object_request, ChecksummedData, Object,
-    QueryWriteStatusRequest, QueryWriteStatusResponse, ReadObjectRequest, ReadObjectResponse,
-    StartResumableWriteRequest, StartResumableWriteResponse, WriteObjectRequest,
-    WriteObjectResponse, WriteObjectSpec,
+    QueryWriteStatusRequest, ReadObjectRequest, StartResumableWriteRequest, WriteObjectRequest,
+    WriteObjectSpec,
 };
 use nativelink_config::stores::GCSSpec;
 use nativelink_error::{make_err, Code, Error, ResultExt};
@@ -39,12 +37,10 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rand::rngs::OsRng;
 use rand::Rng;
-use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Status};
 
 // use tracing::{event, Level};
 use crate::cas_utils::is_zero_digest;
@@ -80,7 +76,7 @@ pub struct CredentialProvider {
 }
 
 impl CredentialProvider {
-    pub async fn new() -> Result<Self, Error> {
+    async fn new() -> Result<Self, Error> {
         let token = Self::fetch_gcs_token().await?;
         let expiry = Instant::now() + Duration::from_secs(3600); // Default expiry duration
         Ok(Self {
@@ -132,73 +128,16 @@ impl CredentialProvider {
         }
     }
 }
-pub trait StorageClientTrait: Send + Sync {
-    fn read_object(
-        &self,
-        request: Request<ReadObjectRequest>,
-    ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>;
-
-    fn write_object(
-        &self,
-        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
-    ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>>;
-
-    fn start_resumable_write(
-        &self,
-        request: Request<StartResumableWriteRequest>,
-    ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>>;
-
-    fn query_write_status(
-        &self,
-        request: Request<QueryWriteStatusRequest>,
-    ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>>;
-}
-
-impl StorageClientTrait for StorageClient<Channel> {
-    fn read_object(
-        &self,
-        request: Request<ReadObjectRequest>,
-    ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
-    {
-        let client = self.clone();
-        Box::pin(async move { client.read_object(request).await })
-    }
-
-    fn write_object(
-        &self,
-        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
-    ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>> {
-        let client = self.clone();
-        Box::pin(async move { client.write_object(request).await })
-    }
-
-    fn start_resumable_write(
-        &self,
-        request: Request<StartResumableWriteRequest>,
-    ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>> {
-        let client = self.clone();
-        Box::pin(async move { client.start_resumable_write(request).await })
-    }
-
-    fn query_write_status(
-        &self,
-        request: Request<QueryWriteStatusRequest>,
-    ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>> {
-        let client = self.clone();
-        Box::pin(async move { client.query_write_status(request).await })
-    }
-}
 
 #[derive(MetricsComponent)]
 pub struct GCSStore<NowFn> {
     // The gRPC client for GCS
-    gcs_client: Arc<dyn StorageClientTrait>,
-    // gcs_client: Arc<StorageClient<Channel>>,
+    gcs_client: Arc<StorageClient<Channel>>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the GCS store")]
     bucket: String,
     #[metric(help = "The key prefix for the GCS store")]
-    pub key_prefix: String,
+    key_prefix: String,
     retrier: Retrier,
     #[metric(help = "The number of seconds to consider an object expired")]
     consider_expired_after_s: i64,
@@ -237,21 +176,21 @@ where
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
 
         let credential_provider = Arc::new(CredentialProvider::new().await?);
-        let gcs_client: Arc<dyn StorageClientTrait> = Arc::new(StorageClient::new(channel));
 
-        Self::new_with_client_and_jitter(spec, gcs_client, credential_provider, jitter_fn, now_fn)
+        Self::new_with_client_and_jitter(spec, channel, credential_provider, jitter_fn, now_fn)
     }
 
     pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
-        gcs_client: Arc<dyn StorageClientTrait>,
-        // gcs_client: StorageClient<Channel>,
+        channel: Channel,
         credential_provider: Arc<CredentialProvider>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
     ) -> Result<Arc<Self>, Error> {
+        let gcs_client = StorageClient::new(channel);
+
         Ok(Arc::new(Self {
-            gcs_client,
+            gcs_client: Arc::new(gcs_client),
             now_fn,
             bucket: spec.bucket.to_string(),
             key_prefix: spec.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
@@ -297,8 +236,7 @@ where
 
         self.retrier
             .retry(unfold((), move |state| {
-                // let mut client = (*client).clone();
-                let client = Arc::clone(&client);
+                let mut client = (*client).clone();
 
                 async move {
                     let object_path = self.make_gcs_path(digest);
@@ -419,7 +357,7 @@ where
                 .retrier
                 .retry(unfold((), move |()| {
                     let client = Arc::clone(&self.gcs_client);
-                    let client = Arc::clone(&client);
+                    let mut client = (*client).clone();
                     let gcs_path = gcs_path.clone();
                     let data = data.clone();
 
@@ -433,10 +371,7 @@ where
                             ..Default::default()
                         };
 
-                        let (tx, rx) = mpsc::channel(1);
-
-                        // let request_stream = stream::iter(vec![WriteObjectRequest {
-                        tx.send(WriteObjectRequest {
+                        let request_stream = stream::iter(vec![WriteObjectRequest {
                             first_message: Some(
                                 write_object_request::FirstMessage::WriteObjectSpec(write_spec),
                             ),
@@ -448,17 +383,10 @@ where
                             )),
                             finish_write: true,
                             ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-
-                        drop(tx);
-                        let request_stream = ReceiverStream::new(rx);
-
-                        let request = tonic::Request::new(request_stream);
+                        }]);
 
                         let result = client
-                            .write_object(request)
+                            .write_object(request_stream)
                             .await
                             .map_err(|e| make_err!(Code::Aborted, "WriteObject failed: {e:?}"));
 
@@ -476,6 +404,7 @@ where
             .retrier
             .retry(unfold((), move |()| {
                 let client = Arc::clone(&self.gcs_client);
+                let mut client = (*client).clone();
                 let gcs_path = gcs_path.clone();
                 async move {
                     let write_spec = WriteObjectSpec {
@@ -487,10 +416,10 @@ where
                         ..Default::default()
                     };
 
-                    let request = tonic::Request::new(StartResumableWriteRequest {
+                    let request = StartResumableWriteRequest {
                         write_object_spec: Some(write_spec),
                         ..Default::default()
-                    });
+                    };
 
                     let result = client.start_resumable_write(request).await.map_err(|e| {
                         make_err!(Code::Unavailable, "Failed to start resumable upload: {e:?}")
@@ -524,16 +453,13 @@ where
             self.retrier
                 .retry(unfold(data, move |data| {
                     let client = Arc::clone(&self.gcs_client);
-                    let mut client = Arc::clone(&client);
+                    let mut client = (*client).clone();
                     let upload_id = Arc::clone(&upload_id);
                     let data = data.clone();
                     let offset = offset;
 
                     async move {
-                        let (tx, rx) = mpsc::channel(1);
-
-                        // let request_stream = stream::iter(vec![WriteObjectRequest {
-                        tx.send(WriteObjectRequest {
+                        let request_stream = stream::iter(vec![WriteObjectRequest {
                             first_message: Some(write_object_request::FirstMessage::UploadId(
                                 (*upload_id).clone(),
                             )),
@@ -546,16 +472,10 @@ where
                                 },
                             )),
                             ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-
-                        drop(tx);
-
-                        let request_stream = ReceiverStream::new(rx);
+                        }]);
 
                         let result = client
-                            .write_object(request)
+                            .write_object(request_stream)
                             .await
                             .map_err(|e| make_err!(Code::Aborted, "Failed to upload chunk: {e:?}"));
 
@@ -574,14 +494,13 @@ where
         self.retrier
             .retry(unfold((), move |()| {
                 let client = Arc::clone(&self.gcs_client);
-                // let mut client = (*client).clone();
-                let client = Arc::clone(&client);
+                let mut client = (*client).clone();
                 let upload_id = Arc::clone(&upload_id);
                 async move {
-                    let request = tonic::Request::new(QueryWriteStatusRequest {
+                    let request = QueryWriteStatusRequest {
                         upload_id: (*upload_id).clone(),
                         ..Default::default()
-                    });
+                    };
 
                     let result = client.query_write_status(request).await.map_err(|e| {
                         make_err!(Code::Unavailable, "Failed to finalize upload: {e:?}")
@@ -617,17 +536,16 @@ where
             .retry(unfold(writer, move |writer| {
                 let path = gcs_path.clone();
                 async move {
-                    let request = tonic::Request::new(ReadObjectRequest {
+                    let request = ReadObjectRequest {
                         bucket: self.bucket.clone(),
                         object: path.clone(),
                         read_offset: offset as i64,
                         read_limit: length.unwrap_or(0) as i64,
                         ..Default::default()
-                    });
+                    };
 
                     let client = Arc::clone(&self.gcs_client);
-                    // let mut cloned_client = (*client).clone();
-                    let cloned_client = Arc::clone(&client);
+                    let mut cloned_client = (*client).clone();
 
                     let result = cloned_client.read_object(request).await;
 
