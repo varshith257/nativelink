@@ -18,11 +18,11 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::{unfold, FuturesUnordered};
+use futures::Future;
 use futures::{stream, StreamExt, TryStreamExt};
-// use tokio_stream::StreamExt;
-use bytes::{BufMut, Bytes, BytesMut};
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     storage_client::StorageClient, write_object_request, ChecksummedData, Object as GcsObject,
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadObjectRequest, ReadObjectResponse,
@@ -118,28 +118,10 @@ impl MockableStorageClient for StorageClient<Channel> {
 }
 
 mock! {
-    pub Channel {}
-
-    #[async_trait]
-    impl tonic::transport::Service<http::Request<hyper::Body>> for Channel {
-        type Response = http::Response<tonic::body::BoxBody>;
-        type Error = tonic::transport::Error;
-        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-        fn poll_ready(
-            &mut self,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>>;
-
-        fn call(&mut self, req: http::Request<hyper::Body>) -> Self::Future;
-    }
-}
-
-mock! {
     pub StorageClient {}
 
     #[async_trait::async_trait]
-    impl  MockableStorageClient for StorageClient {
+    impl MockableStorageClient for StorageClient<Channel> {
         fn read_object(
             &self,
             request: Request<ReadObjectRequest>,
@@ -159,17 +141,17 @@ mock! {
 
 fn setup_mock_client(
     response: Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>,
-) -> Arc<StorageClient<MockChannel>> {
+) -> StorageClient<Channel> {
     let mut mock_client = MockStorageClient::new();
     mock_client
         .expect_read_object()
         .return_once(|_| Box::pin(async { response }));
 
-    Arc::new(mock_client)
+    mock_client
 }
 
 async fn create_gcs_store(
-    mock_client: Arc<StorageClient<MockChannel>>,
+    mock_client: StorageClient<Channel>,
 ) -> Arc<GCSStore<impl Fn() -> MockInstantWrapped + Send + Sync>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 

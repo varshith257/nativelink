@@ -176,19 +176,18 @@ where
             .map_err(|e| make_err!(Code::Unavailable, "Failed to connect to GCS: {e:?}"))?;
 
         let credential_provider = Arc::new(CredentialProvider::new().await?);
+        let gcs_client = StorageClient::new(channel);
 
-        Self::new_with_client_and_jitter(spec, channel, credential_provider, jitter_fn, now_fn)
+        Self::new_with_client_and_jitter(spec, gcs_client, credential_provider, jitter_fn, now_fn)
     }
 
     pub fn new_with_client_and_jitter(
         spec: &GCSSpec,
-        channel: Channel,
+        gcs_client: StorageClient<Channel>,
         credential_provider: Arc<CredentialProvider>,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
     ) -> Result<Arc<Self>, Error> {
-        let gcs_client = StorageClient::new(channel);
-
         Ok(Arc::new(Self {
             gcs_client: Arc::new(gcs_client),
             now_fn,
