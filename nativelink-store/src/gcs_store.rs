@@ -139,7 +139,7 @@ pub trait StorageClientTrait: Send + Sync {
 
     fn write_object(
         &self,
-        request: Request<WriteObjectRequest>,
+        request: Request<tonic::Streaming<WriteObjectRequest>>,
     ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>>;
 
     fn start_resumable_write(
@@ -159,28 +159,32 @@ impl StorageClientTrait for StorageClient<Channel> {
         request: Request<ReadObjectRequest>,
     ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
     {
-        Box::pin(async move { self.read_object(request).await })
+        let client = self.clone();
+        Box::pin(async move { client.read_object(request).await })
     }
 
     fn write_object(
         &self,
-        request: Request<WriteObjectRequest>,
+        request: Request<tonic::Streaming<WriteObjectRequest>>,
     ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>> {
-        Box::pin(async move { self.write_object(request).await })
+        let client = self.clone();
+        Box::pin(async move { client.write_object(request).await })
     }
 
     fn start_resumable_write(
         &self,
         request: Request<StartResumableWriteRequest>,
     ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>> {
-        Box::pin(async move { self.start_resumable_write(request).await })
+        let client = self.clone();
+        Box::pin(async move { client.start_resumable_write(request).await })
     }
 
     fn query_write_status(
         &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>> {
-        Box::pin(async move { self.query_write_status(request).await })
+        let client = self.clone();
+        Box::pin(async move { client.query_write_status(request).await })
     }
 }
 
