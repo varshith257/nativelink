@@ -39,7 +39,9 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rand::rngs::OsRng;
 use rand::Rng;
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
@@ -431,7 +433,9 @@ where
                             ..Default::default()
                         };
 
-                        let request_stream = stream::iter(vec![WriteObjectRequest {
+                        let (tx, rx) = mpsc::channel(1);
+                        // let request_stream = stream::iter(vec![WriteObjectRequest {
+                        tx.send(Ok(WriteObjectRequest {
                             first_message: Some(
                                 write_object_request::FirstMessage::WriteObjectSpec(write_spec),
                             ),
@@ -443,8 +447,11 @@ where
                             )),
                             finish_write: true,
                             ..Default::default()
-                        }])
-                        .map(Ok);
+                        }))
+                        .await?;
+
+                        drop(tx);
+                        let request_stream = ReceiverStream::new(rx);
 
                         let request = tonic::Request::new(request_stream);
 
@@ -521,7 +528,9 @@ where
                     let offset = offset;
 
                     async move {
-                        let request_stream = stream::iter(vec![WriteObjectRequest {
+                        let (tx, rx) = mpsc::channel(1);
+                        tx.send(Ok(WriteObjectRequest {
+                            // let request_stream = stream::iter(vec![WriteObjectRequest {
                             first_message: Some(write_object_request::FirstMessage::UploadId(
                                 (*upload_id).clone(),
                             )),
@@ -534,8 +543,11 @@ where
                                 },
                             )),
                             ..Default::default()
-                        }])
-                        .map(Ok);
+                        }))
+                        .await?;
+                        drop(tx);
+
+                        let request_stream = ReceiverStream::new(rx);
 
                         let request = tonic::Request::new(request_stream);
 
