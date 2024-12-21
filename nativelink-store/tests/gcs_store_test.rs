@@ -18,14 +18,16 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::stream::{unfold, FuturesUnordered};
 use futures::{stream, StreamExt, TryStreamExt};
 // use tokio_stream::StreamExt;
 use bytes::{BufMut, Bytes, BytesMut};
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
-    storage_client::StorageClient, write_object_request, ChecksummedData, Object,
-    QueryWriteStatusRequest, ReadObjectRequest, StartResumableWriteRequest, WriteObjectRequest,
-    WriteObjectSpec,
+    storage_client::StorageClient, write_object_request, ChecksummedData, Object as GcsObject,
+    QueryWriteStatusRequest, QueryWriteStatusResponse, ReadObjectRequest, ReadObjectResponse,
+    StartResumableWriteRequest, StartResumableWriteResponse, WriteObjectRequest,
+    WriteObjectResponse, WriteObjectSpec,
 };
 use mock_instant::thread_local::MockClock;
 use mockall::{automock, mock, predicate::*};
