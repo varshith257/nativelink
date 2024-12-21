@@ -86,8 +86,7 @@ impl MockableStorageClient for StorageClient<Channel> {
     fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
-    ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>
-    {
+    ) -> BoxFuture<'static, Result<Response<ReadObjectResponse>, Status>> {
         let client = self.clone();
         Box::pin(async move { client.read_object(request).await })
     }
@@ -118,14 +117,14 @@ impl MockableStorageClient for StorageClient<Channel> {
 }
 
 mock! {
-    pub StorageClient {}
+    pub StorageClient<Channel> {}
 
     #[async_trait::async_trait]
     impl MockableStorageClient for StorageClient<Channel> {
         fn read_object(
             &self,
             request: Request<ReadObjectRequest>,
-        ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>;
+        ) -> BoxFuture<'static, Result<Response<ReadObjectResponse>, Status>>;
 
         fn start_resumable_write(
             &self,
@@ -140,7 +139,7 @@ mock! {
 }
 
 fn setup_mock_client(
-    response: Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>,
+    response: Result<Response<ReadObjectResponse>, Status>,
 ) -> StorageClient<Channel> {
     let mut mock_client = MockStorageClient::new();
     mock_client
