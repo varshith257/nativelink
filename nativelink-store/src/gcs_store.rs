@@ -443,9 +443,10 @@ where
                             )),
                             finish_write: true,
                             ..Default::default()
-                        }]);
+                        }])
+                        .map(Ok);
 
-                        let request = tonic::Request::new(request_stream.map(Ok));
+                        let request = tonic::Request::new(request_stream);
 
                         let result = client
                             .write_object(request)
@@ -533,9 +534,10 @@ where
                                 },
                             )),
                             ..Default::default()
-                        }]);
+                        }])
+                        .map(Ok);
 
-                        let request = tonic::Request::new(request_stream.map(Ok));
+                        let request = tonic::Request::new(request_stream);
 
                         let result = client
                             .write_object(request)
