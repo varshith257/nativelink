@@ -82,7 +82,7 @@ pub trait MockableStorageClient: Send + Sync {
     ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>>;
 }
 
-impl MockableStorageClientTrait for StorageClient<Channel> {
+impl MockableStorageClient for StorageClient<Channel> {
     fn read_object(
         &self,
         request: Request<ReadObjectRequest>,
@@ -121,11 +121,21 @@ mock! {
     pub StorageClient {}
 
     #[async_trait::async_trait]
-    impl StorageClientTrait for StorageClient {
-        async fn read_object(
+    impl  MockableStorageClient for StorageClient {
+        fn read_object(
             &self,
             request: Request<ReadObjectRequest>,
-        ) -> Result<Response<ReadObjectResponse>, Status>;
+        ) -> BoxFuture<'static, Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>>;
+
+        fn start_resumable_write(
+            &self,
+            request: Request<StartResumableWriteRequest>,
+        ) -> BoxFuture<'static, Result<Response<StartResumableWriteResponse>, Status>>;
+
+        fn query_write_status(
+            &self,
+            request: Request<QueryWriteStatusRequest>,
+        ) -> BoxFuture<'static, Result<Response<QueryWriteStatusResponse>, Status>>;
     }
 }
 
