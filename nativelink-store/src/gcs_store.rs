@@ -140,7 +140,7 @@ pub trait StorageClientTrait: Send + Sync {
 
     fn write_object(
         &self,
-        request: Request<tonic::Streaming<WriteObjectRequest>>,
+        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
     ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>>;
 
     fn start_resumable_write(
@@ -166,7 +166,7 @@ impl StorageClientTrait for StorageClient<Channel> {
 
     fn write_object(
         &self,
-        request: Request<tonic::Streaming<WriteObjectRequest>>,
+        request: impl tonic::IntoStreamingRequest<Message = WriteObjectRequest>,
     ) -> BoxFuture<'static, Result<Response<WriteObjectResponse>, Status>> {
         let client = self.clone();
         Box::pin(async move { client.write_object(request).await })
@@ -434,8 +434,9 @@ where
                         };
 
                         let (tx, rx) = mpsc::channel(1);
+
                         // let request_stream = stream::iter(vec![WriteObjectRequest {
-                        tx.send(Ok(WriteObjectRequest {
+                        tx.send(WriteObjectRequest {
                             first_message: Some(
                                 write_object_request::FirstMessage::WriteObjectSpec(write_spec),
                             ),
@@ -447,8 +448,9 @@ where
                             )),
                             finish_write: true,
                             ..Default::default()
-                        }))
-                        .await?;
+                        })
+                        .await
+                        .unwrap();
 
                         drop(tx);
                         let request_stream = ReceiverStream::new(rx);
@@ -529,8 +531,9 @@ where
 
                     async move {
                         let (tx, rx) = mpsc::channel(1);
-                        tx.send(Ok(WriteObjectRequest {
-                            // let request_stream = stream::iter(vec![WriteObjectRequest {
+
+                        // let request_stream = stream::iter(vec![WriteObjectRequest {
+                        tx.send(WriteObjectRequest {
                             first_message: Some(write_object_request::FirstMessage::UploadId(
                                 (*upload_id).clone(),
                             )),
@@ -543,13 +546,13 @@ where
                                 },
                             )),
                             ..Default::default()
-                        }))
-                        .await?;
+                        })
+                        .await
+                        .unwrap();
+
                         drop(tx);
 
                         let request_stream = ReceiverStream::new(rx);
-
-                        let request = tonic::Request::new(request_stream);
 
                         let result = client
                             .write_object(request)
