@@ -42,7 +42,6 @@ use rand::Rng;
 use tokio::time::{sleep, Instant};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::Streaming;
 use tonic::{Request, Response, Status};
 
 // use tracing::{event, Level};
@@ -250,7 +249,7 @@ where
         now_fn: NowFn,
     ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
-            gcs_client: Arc::new(gcs_client),
+            gcs_client,
             now_fn,
             bucket: spec.bucket.to_string(),
             key_prefix: spec.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
@@ -446,7 +445,7 @@ where
                             ..Default::default()
                         }]);
 
-                        let request = tonic::Request::new(request_stream);
+                        let request = tonic::Request::new(request_stream.map(Ok));
 
                         let result = client
                             .write_object(request)
@@ -521,23 +520,22 @@ where
                     let offset = offset;
 
                     async move {
-                        let request_stream =
-                            stream::iter(vec![tonic::Request::new(WriteObjectRequest {
-                                first_message: Some(write_object_request::FirstMessage::UploadId(
-                                    (*upload_id).clone(),
-                                )),
-                                write_offset: offset as i64,
-                                finish_write: is_last_chunk,
-                                data: Some(write_object_request::Data::ChecksummedData(
-                                    ChecksummedData {
-                                        content: data.to_vec(),
-                                        crc32c: Some(crc32c::crc32c(&data)),
-                                    },
-                                )),
-                                ..Default::default()
-                            })]);
+                        let request_stream = stream::iter(vec![WriteObjectRequest {
+                            first_message: Some(write_object_request::FirstMessage::UploadId(
+                                (*upload_id).clone(),
+                            )),
+                            write_offset: offset as i64,
+                            finish_write: is_last_chunk,
+                            data: Some(write_object_request::Data::ChecksummedData(
+                                ChecksummedData {
+                                    content: data.to_vec(),
+                                    crc32c: Some(crc32c::crc32c(&data)),
+                                },
+                            )),
+                            ..Default::default()
+                        }]);
 
-                        let request = tonic::Request::new(request_stream);
+                        let request = tonic::Request::new(request_stream.map(Ok));
 
                         let result = client
                             .write_object(request)
