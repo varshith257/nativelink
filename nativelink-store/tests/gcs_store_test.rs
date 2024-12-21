@@ -118,6 +118,24 @@ impl MockableStorageClient for StorageClient<Channel> {
 }
 
 mock! {
+    pub Channel {}
+
+    #[async_trait]
+    impl tonic::transport::Service<http::Request<hyper::Body>> for Channel {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = tonic::transport::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>>;
+
+        fn call(&mut self, req: http::Request<hyper::Body>) -> Self::Future;
+    }
+}
+
+mock! {
     pub StorageClient {}
 
     #[async_trait::async_trait]
@@ -140,16 +158,18 @@ mock! {
 }
 
 fn setup_mock_client(
-    response: Result<Response<ReadObjectResponse>, Status>,
-) -> Arc<dyn MockableStorageClient> {
+    response: Result<Response<tonic::codec::Streaming<ReadObjectResponse>>, Status>,
+) -> Arc<StorageClient<MockChannel>> {
     let mut mock_client = MockStorageClient::new();
-    mock_client.expect_read_object().return_once(|_| response);
+    mock_client
+        .expect_read_object()
+        .return_once(|_| Box::pin(async { response }));
 
     Arc::new(mock_client)
 }
 
 async fn create_gcs_store(
-    mock_client: Arc<dyn MockableStorageClient>,
+    mock_client: Arc<StorageClient<MockChannel>>,
 ) -> Arc<GCSStore<impl Fn() -> MockInstantWrapped + Send + Sync>> {
     let credential_provider = Arc::new(CredentialProvider::new().await.unwrap());
 

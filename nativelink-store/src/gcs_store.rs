@@ -76,7 +76,7 @@ pub struct CredentialProvider {
 }
 
 impl CredentialProvider {
-    async fn new() -> Result<Self, Error> {
+    pub async fn new() -> Result<Self, Error> {
         let token = Self::fetch_gcs_token().await?;
         let expiry = Instant::now() + Duration::from_secs(3600); // Default expiry duration
         Ok(Self {
